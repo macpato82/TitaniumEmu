@@ -30,10 +30,10 @@ index aeaf654..9a855a9 100644
  
 diff --git a/hw/arm/titanium.c b/hw/arm/titanium.c
 new file mode 100644
-index 0000000..9e63359
+index 0000000..620523d
 --- /dev/null
 +++ b/hw/arm/titanium.c
-@@ -0,0 +1,360 @@
+@@ -0,0 +1,430 @@
 +/*
 + * Elesar Titanium machine model (TI AM5728, dual Cortex-A15) - EXPERIMENTAL
 + *
@@ -261,6 +261,15 @@ index 0000000..9e63359
 +            (woff & 0xfff) == 0x10) {
 +            val &= ~(uint64_t)0x3;
 +        }
++        /*
++         * USB1/USB2 subsystem (USBOTGSS) SYSCONFIG at +0x10: the HAL also polls
++         * bit17 (a self-clearing init/standby-transition bit) to clear. Model
++         * it as completing instantly.
++         */
++        if (phys >= 0x48880000 && phys < 0x48960000 &&
++            (woff & 0xfff) == 0x10) {
++            val &= ~(uint64_t)0x20000;
++        }
 +    }
 +
 +    g_hash_table_insert(s->regs, GUINT_TO_POINTER((guint)woff),
@@ -274,6 +283,72 @@ index 0000000..9e63359
 +    .valid.min_access_size = 1,
 +    .valid.max_access_size = 4,
 +};
++
++/*
++ * OMAP UART extension registers (above the 16550 core at offset 0x20).
++ *
++ * The 16550-compatible part (RHR/THR/IER/LCR/LSR/... at 0x00-0x1C) is handled
++ * by a serial_mm device, which is what actually emits characters. The OMAP
++ * UART adds registers at 0x20+ that the HAL drives during UART setup; modelled
++ * here so the HAL's UART init completes and HAL_Debug output works:
++ *   0x20 MDR1  - mode select (0 = UART 16x); stored
++ *   0x44 SSR   - bit0 TX_FIFO_FULL: report not full (TX ready)
++ *   0x50 MVR   - module version: nonzero
++ *   0x54 SYSC  - bit1 SOFTRESET self-clears (instant reset)
++ *   0x58 SYSS  - bit0 RESETDONE: reset complete
++ */
++typedef struct {
++    uint32_t regs[64];
++} TitaniumUartExt;
++
++static uint64_t titanium_uartext_read(void *opaque, hwaddr off, unsigned size)
++{
++    TitaniumUartExt *u = opaque;
++    hwaddr uoff = 0x20 + (off & ~(hwaddr)3);
++
++    switch (uoff) {
++    case 0x58: return 1;            /* SYSS: RESETDONE */
++    case 0x44: return 0;            /* SSR: TX_FIFO_FULL = 0 (TX ready) */
++    case 0x50: return 0x50410805;   /* MVR: module version (nonzero) */
++    default:   return u->regs[((off & ~(hwaddr)3) >> 2) & 63];
++    }
++}
++
++static void titanium_uartext_write(void *opaque, hwaddr off, uint64_t val,
++                                   unsigned size)
++{
++    TitaniumUartExt *u = opaque;
++    hwaddr uoff = 0x20 + (off & ~(hwaddr)3);
++
++    if (uoff == 0x54) {
++        val &= ~(uint64_t)0x2;      /* SYSC: SOFTRESET self-clears */
++    }
++    u->regs[((off & ~(hwaddr)3) >> 2) & 63] = (uint32_t)val;
++}
++
++static const MemoryRegionOps titanium_uartext_ops = {
++    .read = titanium_uartext_read,
++    .write = titanium_uartext_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 4,
++};
++
++static void titanium_uart_init(MemoryRegion *sysmem, hwaddr base,
++                               qemu_irq irq, Chardev *chr)
++{
++    TitaniumUartExt *uext = g_new0(TitaniumUartExt, 1);
++    MemoryRegion *ext = g_new(MemoryRegion, 1);
++
++    /* 16550 core (handles char I/O and emits output) */
++    serial_mm_init(sysmem, base, 2, irq, 48000000 / 16, chr,
++                   DEVICE_NATIVE_ENDIAN);
++
++    /* OMAP extension registers at base+0x20 (over the L4 stub) */
++    memory_region_init_io(ext, NULL, &titanium_uartext_ops, uext,
++                          "titanium.uart-ext", 0xE0);
++    memory_region_add_subregion(sysmem, base + 0x20, ext);
++}
 +
 +static void titanium_init(MachineState *machine)
 +{
@@ -364,14 +439,9 @@ index 0000000..9e63359
 +                          "titanium.l4stub", 0x18000000);
 +    memory_region_add_subregion_overlap(sysmem, 0x44000000, l4, -1);
 +
-+    /*
-+     * UART1 - the HAL's debug port. The OMAP UART is 16550-compatible with
-+     * registers spaced every 4 bytes (regshift 2) and a 48 MHz functional
-+     * clock. This is enough for the HAL's polled THR/LSR debug output.
-+     */
-+    serial_mm_init(sysmem, TITANIUM_UART1_BASE, 2,
-+                   pic[TITANIUM_UART1_IRQ], 48000000 / 16,
-+                   serial_hd(0), DEVICE_NATIVE_ENDIAN);
++    /* UART1 - the HAL's debug port (16550 core + OMAP extension registers) */
++    titanium_uart_init(sysmem, TITANIUM_UART1_BASE,
++                       pic[TITANIUM_UART1_IRQ], serial_hd(0));
 +
 +    /* Boot via the emulated AM5728 mask-ROM GP path */
 +    titanium_load_rom(machine);

@@ -88,13 +88,24 @@ needs, all derived by tracing the real ROM:
 With these the HAL runs ~960 basic blocks: clocks → DDR → HAL load → MMU on →
 HAL at 0xFC000000 → device init (resets timers, probes GPIO/I2C/PCIe).
 
-Next (Phase 2 continued) — to reach the `HAL_Debug` UART banner:
-- Continue per-peripheral modelling as the HAL touches them (watchdog, more
-  timers/GPIO, CTRL pad config).
-- Crucially, replace the generic 16550 UART with a proper **OMAP UART** model
-  (MDR1 mode select, SYSC/SYSS, extra registers) — the 16550 alone won't honour
-  the HAL's OMAP-specific UART init, so the banner needs this.
-- Then full PRCM/CTRL/EMIF device models, DSS display, MMC/SD, USB (xHCI), CPSW.
+**OMAP UART implemented:** the 16550 core (`serial_mm`, which emits chars) plus
+an OMAP extension model at +0x20 — MDR1 mode select, SSR (TX ready), MVR, and
+SYSC/SYSS soft-reset/RESETDONE — so the HAL's OMAP-specific UART init completes
+and HAL_Debug output will emit once reached.
+
+The HAL now runs ~1000 blocks through device init: clocks, DDR, MMU, timer
+resets, GPIO/I2C/PCIe probes, and USB1/USB2 subsystem reset. It has not yet hit
+a HAL_Debug UART write — the first banner is evidently further into device init
+(or in the kernel handover).
+
+Next — the honest picture:
+- Reaching the banner is a long tail of per-peripheral init (next blocker is a
+  PRCM poll at 0x4A084C04, then likely DSS/MMC/CPSW/more USB). Hand-stubbing
+  each register works but doesn't clearly converge.
+- Better strategy from here: (a) study HAL_Titanium to find exactly where/if it
+  first writes the UART and what it gates on; and/or (b) build real device
+  models for the critical-path peripherals (PRCM/CTRL, USB) rather than ad-hoc
+  register stubs.
 
 ### Boot progress reached (this milestone)
 
