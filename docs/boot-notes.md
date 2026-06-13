@@ -211,3 +211,26 @@ HAL_InitDevices / Registering devices / AMBControl_Init / ModuleInitForKbdScan
 RISC OS is now into module initialisation with IRQs enabled. Next blocker: a
 tight SWI loop during `ModuleInitForKbdScan` (millions of SVC exceptions) - the
 keyboard-scan module init, to investigate next.
+
+## Investigating: the ModuleInitForKbdScan SWI loop
+
+`ModuleInitForKbdScan` (`Kernel/s/ModHand`) starts the subset of ROM modules the
+HAL declares as keyboard-scan dependencies. On Titanium that list
+(`HAL_KbdScanDependencies`) is:
+
+```
+SharedCLibrary, BufferManager, DeviceFS, RTSupport, USBDriver, XHCIDriver,
+InternationalKeyboard
+```
+
+The keyboard is USB, so the prime suspect is `XHCIDriver`/`USBDriver` initialising
+the xHCI USB host controller, which we do not model yet - its init likely polls
+controller status that never settles. The system timer is running (~100 Hz, IRQs
+serviced), so this is a hardware-wait loop, not a stuck-clock delay. The varying
+SVC immediates in the loop indicate a higher-level retry path, not a single poll.
+
+The kernel already prints `"init mod <name>"` per module during ROM init, but via
+the OS VDU path (`OS_WriteS`/`OS_Write0`), which isn't routed to the serial port.
+Enabling the kernel `DebugTerminal` option (route OS `WRCH`/`RDCH` through the HAL
+serial) will surface every module name and pinpoint the exact module that hangs -
+that is the next diagnostic step.
