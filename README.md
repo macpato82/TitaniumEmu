@@ -72,13 +72,24 @@ Working:
   config → early secure `SMC` (via QEMU PSCI) → DPLL lock + module-clock polls
   (satisfied by the PRCM stub) → **EMIF/DDR init** → **loads the HAL from the
   QSPI window into DRAM and jumps to it**.
-- The main RISC OS HAL image now executes from DDR (≈`0xC0000000`).
+- The HAL is staged in DDR (≈`0xC0000000`), **enables the MMU**, and runs at
+  its linked address **`0xFC000000`** — i.e. into HAL device initialisation.
+- Currently stops at an OMAP peripheral **soft-reset wait** (write `SOFTRESET`,
+  poll the bit to self-clear) during device init.
 
 Next (Phase 2 continued):
-- Carry the HAL forward to its first UART banner (more clocks/CTRL/watchdog/
-  timer as it touches them; verify the UART config path).
-- Then proper PRCM/CTRL/EMIF device models (replace the heuristic stub), DSS
-  display, MMC/SD, USB (xHCI), CPSW ethernet.
+- This is the limit of the generic PRCM/status heuristic: each peripheral the
+  HAL now touches (timer, watchdog, UART, ...) needs its real reset/status
+  semantics. Implement proper device models — starting with the OMAP
+  SYSCONFIG/SYSSTATUS reset handshake and the timers — to carry the HAL to its
+  first `HAL_Debug` UART output (the banner).
+- Then full PRCM/CTRL/EMIF models, DSS display, MMC/SD, USB (xHCI), CPSW.
+
+### Boot progress reached (this milestone)
+
+`reset → OCMC first-stage → clocks/DPLLs → DDR init → HAL loaded from QSPI →
+HAL in DDR → MMU on → HAL at 0xFC000000 (device init)` — ~700 basic blocks,
+no aborts. See `docs/boot-notes.md`.
 
 ## Credits / licences
 

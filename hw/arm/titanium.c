@@ -132,12 +132,20 @@ static uint64_t titanium_l4_read(void *opaque, hwaddr off, unsigned size)
     gpointer key = GUINT_TO_POINTER((guint)woff);
 
     /*
-     * A register that software writes is a control register: return exactly
-     * what was written (so e.g. CLKCTRL IDLEST bits read back as 0 = FULL,
-     * satisfying "wait for module ready" loops).
+     * A register that software writes is a control register. Two cases:
+     *  - CM_CORE_AON clock-domain state control (CM_*_CLKSTCTRL, ~0x4A005000):
+     *    the boot writes a clock-domain transition request then polls the same
+     *    register's state-status bits [17:16] for completion. Report the
+     *    transition done so the poll exits.
+     *  - Otherwise return the written value verbatim (so CLKCTRL IDLEST bits
+     *    read back as 0 = FULL, satisfying "wait for module ready" loops).
      */
     if (g_hash_table_contains(s->regs, key)) {
-        return GPOINTER_TO_UINT(g_hash_table_lookup(s->regs, key));
+        uint32_t v = GPOINTER_TO_UINT(g_hash_table_lookup(s->regs, key));
+        if (woff >= 0x06005000 && woff < 0x06006000) { /* CM_CORE_AON state */
+            v |= 0x00030000;
+        }
+        return v;
     }
 
     /*
