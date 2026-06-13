@@ -53,3 +53,23 @@ step in `titanium_load_rom()`.
 - `psci-conduit = SMC` so early SMCs don't dead-end at the monitor vector.
 - Back the L4 peripheral space or accesses raise external (data) aborts.
 - Secondary cores: RISC OS uses a single A15, so the machine is single-core.
+
+## CRITICAL FINDING: no UART output in the production ROM
+
+`HAL_DebugTX` (s/Init) is wrapped in `[ Debug ... ]` conditional assembly. The
+shipped TITANIUM.ROM is built with `Debug = FALSE`:
+- `HAL_DebugTX` compiles to a bare `MOV pc, lr` (no-op) — the HAL never writes
+  the UART.
+- The debug strings ("Entered HAL_Init", "Registering devices") are **not even
+  present** in the ROM (verified with grep) because the `DebugTX` macro emits
+  nothing.
+
+Implication: **there is no UART banner to reach with this ROM.** Chasing
+HAL_Debug serial output is a dead end. RISC OS's visible output goes to the
+screen via the **DSS display subsystem** (→ TFP410 → HDMI), not the serial port.
+
+The realistic path to visible output is therefore: complete HAL device init +
+RISC OS kernel boot, and model the **DSS/DISPC** so the framebuffer RISC OS sets
+up in DRAM can be displayed. This is a large, multi-peripheral effort, not a
+matter of a few more register stubs. A debug-enabled ROM build (Debug=TRUE),
+if obtainable from RISC OS Open, would be the only way to get serial output.
