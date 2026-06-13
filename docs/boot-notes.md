@@ -183,3 +183,31 @@ InitCMOSCache entry          <- new blocker (CMOS/RTC via I2C, not yet modelled)
 
 The CAM/0xF9BFFFF0 blocker is resolved. Next blocker is `InitCMOSCache`
 (`Kernel/s/NewReset`) reading the RTC/NVRAM the HAL accesses over I2C.
+
+## FIXED: CMOS read - modelled the OMAP I2C controller (interrupt-driven)
+
+`InitCMOSCache` reads the 2 KiB CMOS EEPROM (slave 0xA0) on I2C bus 0 via the
+HAL (`HAL_IICTransfer`/`HAL_IICMonitorTransfer`). The HAL kicks the transfer,
+enables `IRQENABLE_SET`, and then *waits for the I2C interrupt* - it does not
+poll. So the controller has to (a) sequence the transfer-progress status bits
+and (b) assert its GIC line.
+
+Modelled a minimal OMAP I2C master at I2C1 `0x48070000` (plus I2C4 `0x4807A000`,
+I2C5 `0x4807C000` for display EDID). On `I2C_CON.STT` it begins a segment and
+exposes `XRDY` (write) or `RRDY` (read); each `I2C_DATA` access advances the
+byte count; the HAL clears the processed bit (W1C on `I2C_IRQSTATUS`) and the
+model re-raises the next bit, ending the segment with `ARDY`. Reads return 0xFF
+(blank EEPROM). The controller asserts its GIC SPI while an enabled status bit
+is set - I2C1 = SPI 56, I2C4 = 62, I2C5 = 60 (HAL `DevNoIIC0..2`).
+
+With this the CMOS read completes and the kernel runs far past it:
+
+```
+InitCMOSCache done / InitDynamicAreas / InitVectors / InitIRQ1 / VduInit
+Machine ID duff,zero substituted / KeyInit / OscliInit / Enabling IRQs / IRQs on
+HAL_InitDevices / Registering devices / AMBControl_Init / ModuleInitForKbdScan
+```
+
+RISC OS is now into module initialisation with IRQs enabled. Next blocker: a
+tight SWI loop during `ModuleInitForKbdScan` (millions of SVC exceptions) - the
+keyboard-scan module init, to investigate next.

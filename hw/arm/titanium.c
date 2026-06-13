@@ -30,6 +30,7 @@
 #include "hw/arm/machines-qom.h"
 #include "hw/char/serial-mm.h"
 #include "hw/intc/arm_gic_common.h"
+#include "hw/irq.h"
 #include "system/system.h"
 #include "system/address-spaces.h"
 #include "qom/object.h"
@@ -300,6 +301,193 @@ static const MemoryRegionOps titanium_l4_ops = {
 };
 
 /*
+ * OMAP I2C controller (AM5728), minimal master model.
+ *
+ * The RISC OS HAL drives this register-for-register (HAL_IICTransfer /
+ * HAL_IICMonitorTransfer in HAL_Titanium s/IIC) to talk to the on-board I2C
+ * devices on bus 0 (I2C1): the CMOS/NVRAM EEPROM at slave 0xA0, the RTC, and
+ * the TPS659039 PMIC. The kernel's InitCMOSCache (Kernel/s/NewReset) reads the
+ * 2 KiB EEPROM through it. Without a model the controller never reports the
+ * transfer-progress bits the HAL polls, so the kernel hangs there.
+ *
+ * Registers (offsets, AM5728 TRM): IRQSTATUS_RAW 0x24, IRQSTATUS 0x28,
+ * IRQENABLE_SET 0x2C, IRQENABLE_CLR 0x30, SYSS 0x90, BUF 0x94, CNT 0x98,
+ * DATA 0x9C, CON 0xA4, SA 0xAC.
+ * IRQSTATUS bits: AL 0, NACK 1, ARDY 2, RRDY 3, XRDY 4, BB 12.
+ * CON bits: STT 0x1, STP 0x2, TRX 0x200, MST 0x400, EN 0x8000.
+ *
+ * The transfer is polled, not interrupt-driven: we just expose the right
+ * status bits as the HAL writes/reads I2C_DATA. Reads return 0xFF (a blank
+ * EEPROM), so RISC OS finds an invalid CMOS checksum and resets CMOS to
+ * defaults, which is the correct first-boot behaviour.
+ */
+#define I2C_IRQ_AL    (1u << 0)
+#define I2C_IRQ_NACK  (1u << 1)
+#define I2C_IRQ_ARDY  (1u << 2)
+#define I2C_IRQ_RRDY  (1u << 3)
+#define I2C_IRQ_XRDY  (1u << 4)
+#define I2C_IRQ_BB    (1u << 12)
+#define I2C_CON_STT   (1u << 0)
+#define I2C_CON_STP   (1u << 1)
+#define I2C_CON_TRX   (1u << 9)
+#define I2C_CON_EN    (1u << 15)
+
+typedef struct TitaniumI2C {
+    MemoryRegion mr;
+    qemu_irq irq;
+    uint16_t con, sa, cnt, irqstatus, irqenable, buf;
+    bool active;   /* a segment is in progress */
+    bool is_rx;    /* receive (read) direction */
+} TitaniumI2C;
+
+/* Expose the right progress bit for the current point in the segment. The HAL
+ * clears the processed bit (W1C on IRQSTATUS) after each byte and expects the
+ * hardware to re-raise the next one, so this is called after STT, after each
+ * I2C_DATA access, and after a W1C clear. */
+static void titanium_i2c_set_ready(TitaniumI2C *s)
+{
+    if (!s->active) {
+        return;
+    }
+    if (s->cnt > 0) {
+        s->irqstatus = (s->irqstatus & ~I2C_IRQ_ARDY) |
+                       (s->is_rx ? I2C_IRQ_RRDY : I2C_IRQ_XRDY);
+    } else {
+        s->irqstatus = (s->irqstatus & ~(I2C_IRQ_RRDY | I2C_IRQ_XRDY)) |
+                       I2C_IRQ_ARDY;
+    }
+}
+
+/* The HAL drives the transfer from the I2C interrupt handler (it enables
+ * IRQENABLE_SET and waits), so we must assert the GIC line while an enabled
+ * maskable status bit (AL/NACK/ARDY/RRDY/XRDY) is set. */
+static void titanium_i2c_update_irq(TitaniumI2C *s)
+{
+    int level = (s->irqstatus & s->irqenable & 0x1f) != 0;
+    if (s->irq) {
+        qemu_set_irq(s->irq, level);
+    }
+}
+
+static uint64_t titanium_i2c_read_impl(void *opaque, hwaddr off, unsigned size);
+
+static uint64_t titanium_i2c_read(void *opaque, hwaddr off, unsigned size)
+{
+    uint64_t v = titanium_i2c_read_impl(opaque, off, size);
+    if (getenv("TITANIUM_I2C_TRACE")) {
+        fprintf(stderr, "[i2c] rd  %03x -> %04x\n", (unsigned)(off & 0xfff),
+                (unsigned)v);
+    }
+    titanium_i2c_update_irq(opaque);   /* DATA reads change RRDY/ARDY */
+    return v;
+}
+
+static uint64_t titanium_i2c_read_impl(void *opaque, hwaddr off, unsigned size)
+{
+    TitaniumI2C *s = opaque;
+
+    switch (off & 0xfff) {
+    case 0x24: /* IRQSTATUS_RAW */
+    case 0x28: /* IRQSTATUS */
+        return s->irqstatus;
+    case 0x2c: /* IRQENABLE_SET */
+    case 0x30: /* IRQENABLE_CLR */
+        return s->irqenable;
+    case 0x90: /* SYSS: RESETDONE */
+        return 1;
+    case 0x94: /* BUF */
+        return s->buf;
+    case 0x98: /* CNT */
+        return s->cnt;
+    case 0x9c: /* DATA - receive a byte (status re-evaluated on the W1C clear) */
+        if (s->cnt > 0) {
+            s->cnt--;
+        }
+        return 0xff;   /* blank device */
+    case 0xa4: /* CON (STT/STP already auto-cleared) */
+        return s->con;
+    case 0xac: /* SA */
+        return s->sa;
+    default:
+        return 0;
+    }
+}
+
+static void titanium_i2c_write(void *opaque, hwaddr off, uint64_t val,
+                               unsigned size)
+{
+    TitaniumI2C *s = opaque;
+
+    if (getenv("TITANIUM_I2C_TRACE")) {
+        fprintf(stderr, "[i2c] wr  %03x <- %04x\n", (unsigned)(off & 0xfff),
+                (unsigned)val);
+    }
+    switch (off & 0xfff) {
+    case 0x28: /* IRQSTATUS - write 1 to clear */
+        s->irqstatus &= ~(uint16_t)val;
+        if (s->active && (val & I2C_IRQ_ARDY) && s->cnt == 0) {
+            s->active = false;          /* segment fully consumed */
+        } else {
+            titanium_i2c_set_ready(s);  /* re-raise next progress bit */
+        }
+        break;
+    case 0x2c: /* IRQENABLE_SET */
+        s->irqenable |= (uint16_t)val;
+        break;
+    case 0x30: /* IRQENABLE_CLR */
+        s->irqenable &= ~(uint16_t)val;
+        break;
+    case 0x94: /* BUF */
+        s->buf = (uint16_t)val;
+        break;
+    case 0x98: /* CNT */
+        s->cnt = (uint16_t)val;
+        break;
+    case 0x9c: /* DATA - transmit a byte (status re-evaluated on the W1C clear) */
+        if (s->cnt > 0) {
+            s->cnt--;
+        }
+        break;
+    case 0xa4: /* CON */
+        s->con = (uint16_t)val & ~(I2C_CON_STT | I2C_CON_STP);
+        if (getenv("TITANIUM_I2C_TRACE") && (val & I2C_CON_STT)) {
+            fprintf(stderr, "[i2c] START con=%04x sa=%02x cnt=%d trx=%d\n",
+                    (unsigned)val, s->sa, s->cnt, !!(val & I2C_CON_TRX));
+        }
+        if ((val & I2C_CON_STT) && (val & I2C_CON_EN)) {
+            s->active = true;
+            s->is_rx = !(val & I2C_CON_TRX);
+            titanium_i2c_set_ready(s);
+        }
+        break;
+    case 0xac: /* SA */
+        s->sa = (uint16_t)val;
+        break;
+    default:
+        break;
+    }
+    titanium_i2c_update_irq(s);
+}
+
+static const MemoryRegionOps titanium_i2c_ops = {
+    .read = titanium_i2c_read,
+    .write = titanium_i2c_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
+static void titanium_i2c_init(MemoryRegion *sysmem, hwaddr base,
+                              const char *name, qemu_irq irq)
+{
+    TitaniumI2C *s = g_new0(TitaniumI2C, 1);
+    s->irq = irq;
+    memory_region_init_io(&s->mr, NULL, &titanium_i2c_ops, s, name, 0x1000);
+    /* Priority 0 overlaps (overrides) the L4 stub at -1 for this 4 KiB. */
+    memory_region_add_subregion_overlap(sysmem, base, &s->mr, 0);
+}
+
+/*
  * OMAP UART extension registers (above the 16550 core at offset 0x20).
  *
  * The 16550-compatible part (RHR/THR/IER/LCR/LSR/... at 0x00-0x1C) is handled
@@ -462,6 +650,13 @@ static void titanium_init(MachineState *machine)
     memory_region_init_io(l4, NULL, &titanium_l4_ops, l4s,
                           "titanium.l4stub", 0x18000000);
     memory_region_add_subregion_overlap(sysmem, 0x44000000, l4, -1);
+
+    /* OMAP I2C controllers. Bus 0 (I2C1) carries the CMOS EEPROM, RTC and PMIC;
+     * a real model is needed so the kernel's CMOS read completes. I2C4/I2C5
+     * (display EDID) are modelled too so their transfers don't hang later. */
+    titanium_i2c_init(sysmem, 0x48070000, "titanium.i2c1", pic[56]); /* DevNoIIC0 */
+    titanium_i2c_init(sysmem, 0x4807A000, "titanium.i2c4", pic[62]); /* DevNoIIC1 */
+    titanium_i2c_init(sysmem, 0x4807C000, "titanium.i2c5", pic[60]); /* DevNoIIC2 */
 
     /* UART1 - the HAL's debug port (16550 core + OMAP extension registers) */
     titanium_uart_init(sysmem, TITANIUM_UART1_BASE,
