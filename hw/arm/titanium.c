@@ -106,6 +106,74 @@ static void titanium_load_rom(MachineState *machine)
     qemu_register_reset(titanium_cpu_reset, ARM_CPU(first_cpu));
 }
 
+/*
+ * PHASE 2: minimal PRCM/clock stub over the L4 peripheral space.
+ *
+ * The boot first-stage programs DPLLs and module clocks then polls for status.
+ * Rather than a full PRCM model, this backs the L4 region with a sparse
+ * register store and synthesises the two status patterns the boot waits on:
+ *
+ *   - DPLL lock: a CM_IDLEST_DPLL register sits 4 bytes after its
+ *     CM_CLKMODE_DPLL. When CLKMODE.EN (bits[2:0]) == 7 (DPLL_LOCK), report
+ *     ST_DPLL_CLK (bit 0) set in the following word.
+ *   - Module IDLEST: CLKCTRL IDLEST bits are never written, so they read back
+ *     as 0 (FULL/functional), satisfying "wait for module ready" loops.
+ *
+ * To be replaced by proper PRCM/CTRL/EMIF device models.
+ */
+typedef struct {
+    GHashTable *regs;   /* word-aligned offset -> last written value */
+} TitaniumL4;
+
+static uint64_t titanium_l4_read(void *opaque, hwaddr off, unsigned size)
+{
+    TitaniumL4 *s = opaque;
+    hwaddr woff = off & ~(hwaddr)3;
+    gpointer key = GUINT_TO_POINTER((guint)woff);
+
+    /*
+     * A register that software writes is a control register: return exactly
+     * what was written (so e.g. CLKCTRL IDLEST bits read back as 0 = FULL,
+     * satisfying "wait for module ready" loops).
+     */
+    if (g_hash_table_contains(s->regs, key)) {
+        return GPOINTER_TO_UINT(g_hash_table_lookup(s->regs, key));
+    }
+
+    /*
+     * A register that is never written but sits immediately after a written
+     * (nonzero) control register is a read-only status register the boot is
+     * polling - DPLL lock (CM_IDLEST_DPLL after CM_CLKMODE_DPLL), clock/PRM
+     * transition-done, etc. Report ready (bit 0 set) so the poll completes.
+     */
+    if (woff >= 4) {
+        uint32_t prev = GPOINTER_TO_UINT(g_hash_table_lookup(s->regs,
+                                        GUINT_TO_POINTER((guint)(woff - 4))));
+        if (prev != 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void titanium_l4_write(void *opaque, hwaddr off, uint64_t val,
+                              unsigned size)
+{
+    TitaniumL4 *s = opaque;
+    hwaddr woff = off & ~(hwaddr)3;
+
+    g_hash_table_insert(s->regs, GUINT_TO_POINTER((guint)woff),
+                        GUINT_TO_POINTER((guint)val));
+}
+
+static const MemoryRegionOps titanium_l4_ops = {
+    .read = titanium_l4_read,
+    .write = titanium_l4_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
 static void titanium_init(MachineState *machine)
 {
     MemoryRegion *sysmem = get_system_memory();
@@ -183,17 +251,16 @@ static void titanium_init(MachineState *machine)
     memory_region_add_subregion(sysmem, TITANIUM_QSPI_BASE, qspi);
 
     /*
-     * PHASE 2 SCAFFOLD: low-priority RAM catch-all over the L4 peripheral
-     * space (PRCM, CTRL, pin mux, EMIF cfg, ...). The boot first-stage pokes
-     * many of these registers; without backing them, accesses raise external
-     * aborts. Real devices (UART, GIC) sit on top at higher priority. This is
-     * a stub to be replaced by proper PRCM/CTRL/EMIF models - reads return the
-     * last written value, which satisfies simple "enable then read back" polls
-     * but not status/lock bits that must change on their own.
+     * PHASE 2: minimal PRCM/clock stub over the L4 peripheral space (PRCM,
+     * CTRL, pin mux, EMIF cfg, ...). Backs the region so accesses don't abort,
+     * and synthesises DPLL-lock / module-ready status (see titanium_l4_*).
+     * Real devices (UART, GIC) sit on top at higher priority.
      */
+    TitaniumL4 *l4s = g_new0(TitaniumL4, 1);
+    l4s->regs = g_hash_table_new(NULL, NULL);
     MemoryRegion *l4 = g_new(MemoryRegion, 1);
-    memory_region_init_ram(l4, NULL, "titanium.l4stub", 0x08000000,
-                           &error_fatal);
+    memory_region_init_io(l4, NULL, &titanium_l4_ops, l4s,
+                          "titanium.l4stub", 0x0C000000);
     memory_region_add_subregion_overlap(sysmem, 0x44000000, l4, -1);
 
     /*
@@ -218,7 +285,7 @@ static void titanium_machine_init(MachineClass *mc)
     mc->default_cpus = 1;
     mc->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-a15");
     mc->default_ram_id = "titanium.dram";
-    mc->default_ram_size = 1 * GiB;
+    mc->default_ram_size = 2 * GiB;
 }
 
 /*

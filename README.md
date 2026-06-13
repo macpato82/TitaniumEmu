@@ -65,18 +65,20 @@ ROM's TI GP header, loads the first-stage into OCMC RAM, and starts the CPU.
 ## Status
 
 Working:
-- `titanium` machine registers and constructs the AM5728 core (CPU, GIC, DDR,
-  OCMC, UART, QSPI window).
+- `titanium` machine (single Cortex-A15, as RISC OS uses) constructs the AM5728
+  core: GIC, 2 GB DDR, OCMC, UART, QSPI window, and an L4 PRCM/clock stub.
 - Emulated GP mask-ROM boot loads and enters the ROM's first-stage.
-- First-stage executes: Secure SVC setup → `SCTLR`/`ACTLR` config → an early
-  secure `SMC` (serviced via QEMU's PSCI conduit) → PRCM clock-control writes.
+- First-stage runs all the way through: Secure SVC setup → `SCTLR`/`ACTLR`
+  config → early secure `SMC` (via QEMU PSCI) → DPLL lock + module-clock polls
+  (satisfied by the PRCM stub) → **EMIF/DDR init** → **loads the HAL from the
+  QSPI window into DRAM and jumps to it**.
+- The main RISC OS HAL image now executes from DDR (≈`0xC0000000`).
 
-Next (Phase 2):
-- Replace the L4 RAM stub with real **PRCM/DPLL** (report DPLL lock + module
-  ready), **EMIF/DDR** init, and the **CTRL** (pin-mux) module, so the
-  first-stage finishes clock/DDR setup and loads the HAL from QSPI — expected
-  to reach the HAL's UART banner.
-- Then: DSS display, MMC/SD, USB (xHCI), CPSW ethernet.
+Next (Phase 2 continued):
+- Carry the HAL forward to its first UART banner (more clocks/CTRL/watchdog/
+  timer as it touches them; verify the UART config path).
+- Then proper PRCM/CTRL/EMIF device models (replace the heuristic stub), DSS
+  display, MMC/SD, USB (xHCI), CPSW ethernet.
 
 ## Credits / licences
 
