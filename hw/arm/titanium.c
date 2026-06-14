@@ -245,6 +245,25 @@ static uint64_t titanium_l4_read_impl(void *opaque, hwaddr off, unsigned size)
         if (phys == 0x4A002E00) {
             return stored | (1u << 24);
         }
+        /* OMAP UART SYSS (offset 0x58): RESETDONE. The Serial module soft-resets
+         * every UART (UART2..10) and polls SYSS; report reset complete. */
+        if ((woff & 0xfff) == 0x58 &&
+            ((phys >= 0x48020000 && phys < 0x48021000) ||
+             (phys >= 0x48066000 && phys < 0x4806F000) ||
+             (phys >= 0x48420000 && phys < 0x48425000) ||
+             (phys >= 0x4AE2B000 && phys < 0x4AE2C000))) {
+            return 1;
+        }
+        /* CPSW MDIO_USERACCESS0/1 (0x48485080/84): clear the GO bit (read done)
+         * with ACK=0 so the driver concludes there is no PHY and moves on. */
+        if (phys == 0x48485080 || phys == 0x48485084) {
+            return 0;
+        }
+        /* HDMI_WP_PWR_CTRL (0x58040040): the HDMI driver writes PHYPWRCMD
+         * (bits 3:2) and polls PHYPWRSTATUS (bits 1:0) to match. Mirror them. */
+        if (phys == 0x58040040) {
+            return (stored & ~0x3u) | ((stored >> 2) & 0x3u);
+        }
         /* OMAP HSMMC SYSCTL (offset 0x22C, MMC1..4): reset bits (24-26) self-clear;
            ICE (bit0) -> ICS (bit1) clock stable. */
         if ((woff & 0xfff) == 0x22c &&
@@ -374,6 +393,17 @@ static void titanium_l4_write(void *opaque, hwaddr off, uint64_t val,
          */
         if (phys == 0x4A140004) {
             val &= ~(uint64_t)0x1;
+        }
+        /*
+         * OMAP UART SYSC (offset 0x54): SOFTRESET (bit1) self-clears. The Serial
+         * module soft-resets every UART (UART2..10) and polls for completion.
+         */
+        if ((woff & 0xfff) == 0x54 &&
+            ((phys >= 0x48020000 && phys < 0x48021000) ||
+             (phys >= 0x48066000 && phys < 0x4806F000) ||
+             (phys >= 0x48420000 && phys < 0x48425000) ||
+             (phys >= 0x4AE2B000 && phys < 0x4AE2C000))) {
+            val &= ~(uint64_t)0x2;
         }
     }
 
