@@ -464,11 +464,24 @@ typedef struct TitaniumI2C {
     bool ddc;      /* this bus is an HDMI/DVI DDC channel (serves EDID) */
     uint8_t edid[256];
     uint8_t edid_ptr;
-    uint8_t mem[256];   /* CMOS/board EEPROM at slave 0x50 (read/write) */
-    uint8_t mem_addr;
+    /* CMOS/NVMemory: a 2 KiB I2C EEPROM (24C16-style) at IIC addr 0xA0, i.e.
+     * 7-bit slaves 0x50..0x57 = 8 blocks of 256 bytes; the byte address is
+     * ((sa & 7) << 8) | offset, where offset is the 1-byte in-block address. */
+    uint8_t mem[2048];
+    uint8_t mem_addr;   /* in-block byte offset (auto-increments, wraps at 256) */
     uint8_t seg_byte;   /* byte index within the current write segment */
     const char *persist; /* host file backing mem[] (CMOS); NULL = volatile */
 } TitaniumI2C;
+
+/* Full byte address into the 2 KiB CMOS for the current slave + in-block offset. */
+static inline uint32_t titanium_cmos_addr(TitaniumI2C *s)
+{
+    return (((uint32_t)(s->sa & 7)) << 8) | s->mem_addr;
+}
+static inline bool titanium_is_cmos(TitaniumI2C *s)
+{
+    return !s->ddc && (s->sa & 0x78) == 0x50;   /* slaves 0x50..0x57 */
+}
 
 /* Persist the CMOS EEPROM to its host backing file so RISC OS configuration
  * (screen mode, mouse, keyboard, etc.) survives across reboots. */
@@ -548,11 +561,13 @@ static uint64_t titanium_i2c_read_impl(void *opaque, hwaddr off, unsigned size)
         if (s->cnt > 0) {
             s->cnt--;
         }
-        if (s->sa == 0x50) {
-            if (s->ddc) {
-                return s->edid[s->edid_ptr++];   /* serve EDID to the DDC read */
-            }
-            return s->mem[s->mem_addr++];        /* CMOS/board EEPROM readback */
+        if (s->ddc && s->sa == 0x50) {
+            return s->edid[s->edid_ptr++];   /* serve EDID to the DDC read */
+        }
+        if (titanium_is_cmos(s)) {
+            uint8_t v = s->mem[titanium_cmos_addr(s)];   /* 2KiB CMOS readback */
+            s->mem_addr++;                                /* in-block auto-increment */
+            return v;
         }
         return 0xff;   /* blank device */
     case 0xa4: /* CON (STT/STP already auto-cleared) */
@@ -598,14 +613,15 @@ static void titanium_i2c_write(void *opaque, hwaddr off, uint64_t val,
         if (s->cnt > 0) {
             s->cnt--;
         }
-        if (s->sa == 0x50) {
-            if (s->ddc) {
-                s->edid_ptr = (uint8_t)val;   /* DDC read offset within the EDID */
-            } else if (s->seg_byte == 0) {
-                s->mem_addr = (uint8_t)val;   /* EEPROM offset (1-byte) */
+        if (s->ddc && s->sa == 0x50) {
+            s->edid_ptr = (uint8_t)val;   /* DDC read offset within the EDID */
+        } else if (titanium_is_cmos(s)) {
+            if (s->seg_byte == 0) {
+                s->mem_addr = (uint8_t)val;   /* in-block byte offset */
             } else {
-                s->mem[s->mem_addr++] = (uint8_t)val;  /* EEPROM data */
-                titanium_cmos_flush(s);                /* persist if file-backed */
+                s->mem[titanium_cmos_addr(s)] = (uint8_t)val;  /* CMOS data */
+                s->mem_addr++;                                  /* in-block auto-increment */
+                titanium_cmos_flush(s);                         /* persist if file-backed */
             }
             s->seg_byte++;
         }
