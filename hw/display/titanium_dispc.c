@@ -37,6 +37,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(TitaniumDISPCState, TITANIUM_DISPC)
 #define R_IRQSTATUS      (0x18 / 4)
 #define R_IRQENABLE      (0x1C / 4)
 #define R_CONTROL1       (0x40 / 4)
+#define R_SIZE_LCD       (0x7C / 4)
 #define R_GFX_BA_0       (0x80 / 4)
 #define R_GFX_SIZE       (0x8C / 4)
 #define R_GFX_ATTRIBUTES (0xA0 / 4)
@@ -177,11 +178,24 @@ static void draw_line16(void *opaque, uint8_t *d, const uint8_t *s,
     }
 }
 
+/* CLUT8 (8bpp) -> grayscale by index. RISC OS's palette here is ~a gamma ramp,
+ * so index-as-luminance reproduces the (largely monochrome) desktop well. */
+static void draw_line8(void *opaque, uint8_t *d, const uint8_t *s,
+                       int width, int deststep)
+{
+    while (width--) {
+        uint8_t v = *s;
+        *(uint32_t *)d = rgb_to_pixel32(v, v, v);
+        s += 1;
+        d += 4;
+    }
+}
+
 static bool dispc_enabled(TitaniumDISPCState *s)
 {
+    /* Don't require GFX_ATTR_ENABLE: RISC OS toggles it during updates. */
     return (s->regs[R_CONTROL1] &
             (CONTROL1_LCDENABLE | CONTROL1_DIGITALENABLE)) &&
-           (s->regs[R_GFX_ATTRIBUTES] & GFX_ATTR_ENABLE) &&
            s->regs[R_GFX_BA_0] != 0;
 }
 
@@ -190,6 +204,12 @@ static void dispc_update_geometry(TitaniumDISPCState *s)
     uint32_t sz = s->regs[R_GFX_SIZE];
     uint32_t w = (sz & 0x7ff) + 1;
     uint32_t h = ((sz >> 16) & 0x7ff) + 1;
+
+    if (w <= 1 || h <= 1) {     /* GFX_SIZE unset: use the LCD panel size */
+        uint32_t lcd = s->regs[R_SIZE_LCD];
+        w = (lcd & 0x7ff) + 1;
+        h = ((lcd >> 16) & 0x7ff) + 1;
+    }
 
     if (w != s->width || h != s->height) {
         s->width = w;
@@ -207,8 +227,9 @@ static void dispc_gfx_update(void *opaque)
     DisplaySurface *surface = qemu_console_surface(s->con);
     uint32_t fmt = (s->regs[R_GFX_ATTRIBUTES] >> GFX_ATTR_FORMAT_SHIFT) &
                    GFX_ATTR_FORMAT_MASK;
-    int bpp = (fmt == 0x6) ? 2 : 4;   /* 0x6 = RGB16 (565); else 32bpp */
-    drawfn fn = (bpp == 2) ? draw_line16 : draw_line32;
+    /* fmt: 0x6 = RGB16; 0x8/0x9/0xC/0xD = 32bpp; else (0..3) = CLUT8/8bpp */
+    int bpp = (fmt == 0x6) ? 2 : (fmt >= 0x8) ? 4 : 1;
+    drawfn fn = (bpp == 1) ? draw_line8 : (bpp == 2) ? draw_line16 : draw_line32;
     int first = 0, last = 0;
     int src_width;
 
