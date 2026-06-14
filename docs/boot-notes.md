@@ -316,7 +316,30 @@ bring-up**, not the GC320 GPU itself. Progress made on it:
 With these the blob performs a **complete DISPC mode-set** - timings, the
 256-entry gamma LUT, `GFX_BA_0 = 0x80000000`, display enable - enables
 `DISPC_IRQENABLE.VSYNC`, and its VSYNC interrupt is now delivered and serviced
-(hundreds of IRQs handled). However `GC320Video` init still does not return: the
-blob waits on a further dependency, most likely the **HDMI core/PHY readiness or
-hotplug-detect / EDID** path (EDID is read over I2C4/I2C5). Completing the visible
-desktop is the remaining work and is a multi-step HDMI bring-up effort.
+(hundreds of IRQs handled). The blob then read **EDID** over the DDC I2C buses (write-2/read pattern,
+retried hundreds of times when invalid) and read/wrote the **board EEPROM** on
+I2C1. Two more fixes cleared those:
+
+- DDC I2C buses (I2C4/I2C5) now serve a valid **EDID** (via `qemu_edid_generate`,
+  `select EDID`), so the driver finds a connected 1280x1024 display.
+- I2C1 slave `0x50` is now a real read/write **EEPROM** (256 bytes), so the
+  driver's write-then-verify of the board/CMOS EEPROM succeeds.
+
+That advanced the blob to the actual **GC320 GPU bring-up**: it resets the GPU
+and polls `AQHiIdle` (`0x59000004`); reporting all blocks idle let `GC320Video`
+init finally complete.
+
+## RISC OS now boots through ~150 modules (almost the full system)
+
+With GC320Video done, the boot ran through the entire main module set - BASIC,
+ColourTrans, DisplayManager, Draw, FileCore, FontManager, FPEmulator, IIC, RTC,
+Serial, SoundDMA (audio codec init), WaveSynth, DOSFS, SCSIDriver, TaskWindow,
+ShellCLI and dozens more - clearing one more peripheral on the way:
+
+- SATA AHCI `GHC` (`0x4A140004`) `HR` reset bit now self-clears, so `SATADriver`
+  init completes.
+
+Boot now reaches **~module 150 (`SDIODriver`)** - i.e. essentially the whole
+RISC OS module set initialises. Remaining: a few more device modules (SDIO/MMC
+etc.) then the desktop. Each is the same pattern - a status/reset register the
+driver polls - found quickly with the `TITANIUM_TRACE` hot-read logger.

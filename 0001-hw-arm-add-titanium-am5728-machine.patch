@@ -1,8 +1,8 @@
 diff --git a/hw/arm/Kconfig b/hw/arm/Kconfig
-index 7877506..e2a2339 100644
+index 7877506..7d99fa3 100644
 --- a/hw/arm/Kconfig
 +++ b/hw/arm/Kconfig
-@@ -271,6 +271,14 @@ config VERSATILE
+@@ -271,6 +271,15 @@ config VERSATILE
      select REALVIEW
      select USB_OHCI_SYSBUS
  
@@ -13,6 +13,7 @@ index 7877506..e2a2339 100644
 +    select A15MPCORE
 +    select SERIAL_MM
 +    select TITANIUM_DISPC
++    select EDID
 +
  config VEXPRESS
      bool
@@ -31,10 +32,10 @@ index aeaf654..9a855a9 100644
  
 diff --git a/hw/arm/titanium.c b/hw/arm/titanium.c
 new file mode 100644
-index 0000000..679a7c8
+index 0000000..c2804b7
 --- /dev/null
 +++ b/hw/arm/titanium.c
-@@ -0,0 +1,979 @@
+@@ -0,0 +1,1058 @@
 +/*
 + * Elesar Titanium machine model (TI AM5728, dual Cortex-A15) - EXPERIMENTAL
 + *
@@ -69,6 +70,7 @@ index 0000000..679a7c8
 +#include "hw/intc/arm_gic_common.h"
 +#include "hw/irq.h"
 +#include "qemu/timer.h"
++#include "hw/display/edid.h"
 +#include "system/system.h"
 +#include "system/address-spaces.h"
 +#include "qom/object.h"
@@ -166,7 +168,21 @@ index 0000000..679a7c8
 +    GHashTable *regs;   /* word-aligned offset -> last written value */
 +} TitaniumL4;
 +
++static uint64_t titanium_l4_read_impl(void *opaque, hwaddr off, unsigned size);
++
 +static uint64_t titanium_l4_read(void *opaque, hwaddr off, unsigned size)
++{
++    uint64_t v = titanium_l4_read_impl(opaque, off, size);
++    if (getenv("TITANIUM_HDMI_TRACE")) {
++        uint32_t phys = 0x44000000 + (uint32_t)(off & ~(hwaddr)3);
++        if (phys >= 0x58000000 && phys < 0x58100000) {
++            fprintf(stderr, "[hdmi] rd %08x -> %08x\n", phys, (unsigned)v);
++        }
++    }
++    return v;
++}
++
++static uint64_t titanium_l4_read_impl(void *opaque, hwaddr off, unsigned size)
 +{
 +    TitaniumL4 *s = opaque;
 +    hwaddr woff = off & ~(hwaddr)3;
@@ -179,8 +195,8 @@ index 0000000..679a7c8
 +        }
 +        guint c = GPOINTER_TO_UINT(g_hash_table_lookup(cnt, key)) + 1;
 +        g_hash_table_insert(cnt, key, GUINT_TO_POINTER(c));
-+        if (c == 200000) {
-+            fprintf(stderr, "TITANIUM-L4: spin read at phys 0x%08x\n",
++        if (c == 30000) {
++            fprintf(stderr, "TITANIUM-L4: hot read at phys 0x%08x\n",
 +                    (unsigned)(0x44000000 + woff));
 +        }
 +    }
@@ -298,6 +314,17 @@ index 0000000..679a7c8
 +    }
 +
 +    /*
++     * Vivante GC320 2D GPU (0x59000000). The GC320 video blob resets the GPU
++     * and polls AQHiIdle (0x04) for it to go idle. Report all blocks idle.
++     */
++    {
++        uint32_t phys = 0x44000000 + (uint32_t)woff;
++        if (phys == 0x59000004) {
++            return 0x7fffffff;   /* AQHiIdle: every module idle */
++        }
++    }
++
++    /*
 +     * SerDes/PHY/PLL control space (~0x4A084000..0x4A098000): USB3 PHY
 +     * (OCP2SCP) and the SATA/PCIe SerDes DPLLs (e.g. DPLLCTRL_SATA at
 +     * 0x4A096800). The HAL brings these up and polls status (PLL lock, PHY
@@ -318,6 +345,13 @@ index 0000000..679a7c8
 +{
 +    TitaniumL4 *s = opaque;
 +    hwaddr woff = off & ~(hwaddr)3;
++
++    if (getenv("TITANIUM_HDMI_TRACE")) {
++        uint32_t phys = 0x44000000 + (uint32_t)woff;
++        if (phys >= 0x58000000 && phys < 0x58100000) {
++            fprintf(stderr, "[hdmi] wr %08x <- %08x\n", phys, (unsigned)val);
++        }
++    }
 +
 +    /*
 +     * OMAP peripheral soft-reset, scoped to the L4_PER peripheral region
@@ -351,6 +385,13 @@ index 0000000..679a7c8
 +        if (phys >= 0x58040000 && phys < 0x58041000 &&
 +            (woff & 0xfff) == 0x10) {
 +            val &= ~(uint64_t)0x3;
++        }
++        /*
++         * SATA AHCI global host control (GHC, 0x4A140004): HR (bit0, HBA reset)
++         * self-clears. SATADriver writes it and polls until clear.
++         */
++        if (phys == 0x4A140004) {
++            val &= ~(uint64_t)0x1;
 +        }
 +    }
 +
@@ -404,6 +445,12 @@ index 0000000..679a7c8
 +    uint16_t con, sa, cnt, irqstatus, irqenable, buf;
 +    bool active;   /* a segment is in progress */
 +    bool is_rx;    /* receive (read) direction */
++    bool ddc;      /* this bus is an HDMI/DVI DDC channel (serves EDID) */
++    uint8_t edid[256];
++    uint8_t edid_ptr;
++    uint8_t mem[256];   /* CMOS/board EEPROM at slave 0x50 (read/write) */
++    uint8_t mem_addr;
++    uint8_t seg_byte;   /* byte index within the current write segment */
 +} TitaniumI2C;
 +
 +/* Expose the right progress bit for the current point in the segment. The HAL
@@ -469,6 +516,12 @@ index 0000000..679a7c8
 +        if (s->cnt > 0) {
 +            s->cnt--;
 +        }
++        if (s->sa == 0x50) {
++            if (s->ddc) {
++                return s->edid[s->edid_ptr++];   /* serve EDID to the DDC read */
++            }
++            return s->mem[s->mem_addr++];        /* CMOS/board EEPROM readback */
++        }
 +        return 0xff;   /* blank device */
 +    case 0xa4: /* CON (STT/STP already auto-cleared) */
 +        return s->con;
@@ -513,16 +566,27 @@ index 0000000..679a7c8
 +        if (s->cnt > 0) {
 +            s->cnt--;
 +        }
++        if (s->sa == 0x50) {
++            if (s->ddc) {
++                s->edid_ptr = (uint8_t)val;   /* DDC read offset within the EDID */
++            } else if (s->seg_byte == 0) {
++                s->mem_addr = (uint8_t)val;   /* EEPROM offset (1-byte) */
++            } else {
++                s->mem[s->mem_addr++] = (uint8_t)val;  /* EEPROM data */
++            }
++            s->seg_byte++;
++        }
 +        break;
 +    case 0xa4: /* CON */
 +        s->con = (uint16_t)val & ~(I2C_CON_STT | I2C_CON_STP);
 +        if (getenv("TITANIUM_I2C_TRACE") && (val & I2C_CON_STT)) {
-+            fprintf(stderr, "[i2c] START con=%04x sa=%02x cnt=%d trx=%d\n",
-+                    (unsigned)val, s->sa, s->cnt, !!(val & I2C_CON_TRX));
++            fprintf(stderr, "[i2c] START ddc=%d sa=%02x cnt=%d trx=%d\n",
++                    s->ddc, s->sa, s->cnt, !!(val & I2C_CON_TRX));
 +        }
 +        if ((val & I2C_CON_STT) && (val & I2C_CON_EN)) {
 +            s->active = true;
 +            s->is_rx = !(val & I2C_CON_TRX);
++            s->seg_byte = 0;
 +            titanium_i2c_set_ready(s);
 +        }
 +        break;
@@ -544,10 +608,26 @@ index 0000000..679a7c8
 +};
 +
 +static void titanium_i2c_init(MemoryRegion *sysmem, hwaddr base,
-+                              const char *name, qemu_irq irq)
++                              const char *name, qemu_irq irq, bool ddc)
 +{
 +    TitaniumI2C *s = g_new0(TitaniumI2C, 1);
 +    s->irq = irq;
++    s->ddc = ddc;
++    memset(s->mem, 0xff, sizeof(s->mem));   /* blank EEPROM */
++    if (ddc) {
++        /* Generate a valid EDID so the video driver finds a connected display
++         * and stops retrying the DDC read. */
++        qemu_edid_info info = {
++            .vendor  = "RIS",
++            .name    = "Titanium",
++            .prefx   = 1280,
++            .prefy   = 1024,
++            .maxx    = 1920,
++            .maxy    = 1080,
++            .refresh_rate = 60,
++        };
++        qemu_edid_generate(s->edid, sizeof(s->edid), &info);
++    }
 +    memory_region_init_io(&s->mr, NULL, &titanium_i2c_ops, s, name, 0x1000);
 +    /* Priority 0 overlaps (overrides) the L4 stub at -1 for this 4 KiB. */
 +    memory_region_add_subregion_overlap(sysmem, base, &s->mr, 0);
@@ -964,9 +1044,9 @@ index 0000000..679a7c8
 +    /* OMAP I2C controllers. Bus 0 (I2C1) carries the CMOS EEPROM, RTC and PMIC;
 +     * a real model is needed so the kernel's CMOS read completes. I2C4/I2C5
 +     * (display EDID) are modelled too so their transfers don't hang later. */
-+    titanium_i2c_init(sysmem, 0x48070000, "titanium.i2c1", pic[56]); /* DevNoIIC0 */
-+    titanium_i2c_init(sysmem, 0x4807A000, "titanium.i2c4", pic[62]); /* DevNoIIC1 */
-+    titanium_i2c_init(sysmem, 0x4807C000, "titanium.i2c5", pic[60]); /* DevNoIIC2 */
++    titanium_i2c_init(sysmem, 0x48070000, "titanium.i2c1", pic[56], false); /* CMOS/RTC/PMIC */
++    titanium_i2c_init(sysmem, 0x4807A000, "titanium.i2c4", pic[62], true);  /* DVI2 EDID (DDC) */
++    titanium_i2c_init(sysmem, 0x4807C000, "titanium.i2c5", pic[60], true);  /* DVI1 EDID (DDC) */
 +
 +    /* OMAP DMTIMERs - the kernel uses these for the OS tick (MonotonicTime) and
 +     * fine timing. TIMER2..11, IRQs from HAL DevNoTimer0..5 in StaticWS. */
