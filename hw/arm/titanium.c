@@ -1086,6 +1086,8 @@ static void titanium_init(MachineState *machine)
             sysbus_mmio_get_region(SYS_BUS_DEVICE(xhci), 0), 1);
         sysbus_connect_irq(SYS_BUS_DEVICE(xhci), 0, pic[76]); /* DevNoUSB0 */
     }
+    /* Add USB HID with: -device usb-kbd -device usb-mouse  (RISC OS's USB HID
+     * supports a relative mouse, NOT the absolute usb-tablet). */
     /* USB2: keep the lightweight stub (no devices) so its driver init completes. */
     titanium_xhci_init(sysmem, 0x488D0000, "titanium.xhci2", pic[78]);
 

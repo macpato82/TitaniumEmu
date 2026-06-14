@@ -131,15 +131,19 @@ attached RISC OS detects it and boots interactively.
 
 USB1's xHCI host is a **real QEMU xHCI controller** (`sysbus-xhci`) at the DWC3
 host base `0x48890000` (its 0x4000 MMIO sits below the DWC3 global registers at
-`+0xC100`, which the L4 stub still serves for the HAL). Attach standard USB HID:
+`+0xC100`, which the L4 stub still serves for the HAL). Attach a keyboard and a
+**relative** mouse:
 
 ```sh
 ./build/qemu-system-arm -M titanium -bios TITANIUM.ROM -display sdl \
-    -device usb-kbd -device usb-tablet
+    -device usb-kbd -device usb-mouse
 ```
 
-RISC OS's `XHCIDriver` enumerates them through the real controller - confirmed by
-the kernel no longer reporting "No keyboard present" - so the desktop is usable.
+RISC OS's `XHCIDriver` enumerates them through the real controller (verified: the
+kernel stops reporting "No keyboard present", and host key/mouse events reach the
+desktop). Use **`usb-mouse`** (relative) - RISC OS's USB HID does **not** drive
+the absolute `usb-tablet`. In the window, **click to give it focus** (for the
+keyboard) and to grab the relative mouse; `Ctrl+Alt+G` toggles the grab.
 
 Possible follow-ups: a real colour CLUT for the 8bpp framebuffer (currently
 grayscale), and tidying the synthesised L4 status heuristics into proper device
