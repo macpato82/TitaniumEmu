@@ -464,7 +464,23 @@ typedef struct TitaniumI2C {
     uint8_t mem[256];   /* CMOS/board EEPROM at slave 0x50 (read/write) */
     uint8_t mem_addr;
     uint8_t seg_byte;   /* byte index within the current write segment */
+    const char *persist; /* host file backing mem[] (CMOS); NULL = volatile */
 } TitaniumI2C;
+
+/* Persist the CMOS EEPROM to its host backing file so RISC OS configuration
+ * (screen mode, mouse, keyboard, etc.) survives across reboots. */
+static void titanium_cmos_flush(TitaniumI2C *s)
+{
+    FILE *f;
+    if (!s->persist) {
+        return;
+    }
+    f = fopen(s->persist, "wb");
+    if (f) {
+        fwrite(s->mem, 1, sizeof(s->mem), f);
+        fclose(f);
+    }
+}
 
 /* Expose the right progress bit for the current point in the segment. The HAL
  * clears the processed bit (W1C on IRQSTATUS) after each byte and expects the
@@ -586,6 +602,7 @@ static void titanium_i2c_write(void *opaque, hwaddr off, uint64_t val,
                 s->mem_addr = (uint8_t)val;   /* EEPROM offset (1-byte) */
             } else {
                 s->mem[s->mem_addr++] = (uint8_t)val;  /* EEPROM data */
+                titanium_cmos_flush(s);                /* persist if file-backed */
             }
             s->seg_byte++;
         }
@@ -621,20 +638,34 @@ static const MemoryRegionOps titanium_i2c_ops = {
 };
 
 static void titanium_i2c_init(MemoryRegion *sysmem, hwaddr base,
-                              const char *name, qemu_irq irq, bool ddc)
+                              const char *name, qemu_irq irq, bool ddc,
+                              const char *persist)
 {
     TitaniumI2C *s = g_new0(TitaniumI2C, 1);
     s->irq = irq;
     s->ddc = ddc;
     memset(s->mem, 0xff, sizeof(s->mem));   /* blank EEPROM */
+    if (persist) {
+        /* Load the saved CMOS so RISC OS config persists across reboots. On
+         * first run (no file) the EEPROM stays blank and RISC OS writes its
+         * defaults, which then get saved by titanium_cmos_flush(). */
+        FILE *f = fopen(persist, "rb");
+        s->persist = persist;
+        if (f) {
+            if (fread(s->mem, 1, sizeof(s->mem), f) != sizeof(s->mem)) {
+                memset(s->mem, 0xff, sizeof(s->mem));  /* truncated -> blank */
+            }
+            fclose(f);
+        }
+    }
     if (ddc) {
         /* Generate a valid EDID so the video driver finds a connected display
          * and stops retrying the DDC read. */
         qemu_edid_info info = {
             .vendor  = "RIS",
             .name    = "Titanium",
-            .prefx   = 1280,
-            .prefy   = 1024,
+            .prefx   = 1920,
+            .prefy   = 1080,
             .maxx    = 1920,
             .maxy    = 1080,
             .refresh_rate = 60,
@@ -1057,9 +1088,10 @@ static void titanium_init(MachineState *machine)
     /* OMAP I2C controllers. Bus 0 (I2C1) carries the CMOS EEPROM, RTC and PMIC;
      * a real model is needed so the kernel's CMOS read completes. I2C4/I2C5
      * (display EDID) are modelled too so their transfers don't hang later. */
-    titanium_i2c_init(sysmem, 0x48070000, "titanium.i2c1", pic[56], false); /* CMOS/RTC/PMIC */
-    titanium_i2c_init(sysmem, 0x4807A000, "titanium.i2c4", pic[62], true);  /* DVI2 EDID (DDC) */
-    titanium_i2c_init(sysmem, 0x4807C000, "titanium.i2c5", pic[60], true);  /* DVI1 EDID (DDC) */
+    titanium_i2c_init(sysmem, 0x48070000, "titanium.i2c1", pic[56], false,
+                      getenv("TITANIUM_CMOS")); /* CMOS/RTC/PMIC (persistent) */
+    titanium_i2c_init(sysmem, 0x4807A000, "titanium.i2c4", pic[62], true, NULL);  /* DVI2 EDID (DDC) */
+    titanium_i2c_init(sysmem, 0x4807C000, "titanium.i2c5", pic[60], true, NULL);  /* DVI1 EDID (DDC) */
 
     /* OMAP DMTIMERs - the kernel uses these for the OS tick (MonotonicTime) and
      * fine timing. TIMER2..11, IRQs from HAL DevNoTimer0..5 in StaticWS. */
