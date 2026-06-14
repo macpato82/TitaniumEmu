@@ -637,6 +637,102 @@ static void titanium_timer_init(MemoryRegion *sysmem, hwaddr base,
 }
 
 /*
+ * xHCI USB host controller (the host side of the AM5728 DWC3), register-level.
+ *
+ * The RISC OS XHCIDriver (HWSupport/USB/Controllers/XHCIDriver, NetBSD-derived
+ * xhci_init) reads the capability registers to locate the operational/runtime/
+ * doorbell register blocks, resets the controller (USBCMD.HCRST, self-clearing),
+ * waits for CNR=0, sets up its command/event rings + DCBAA in DMA RAM, then runs
+ * the controller (USBCMD.RS) and returns - it issues no commands and waits for
+ * no events during init. So a register model is enough: present sane capability
+ * registers, a reset/run handshake, and root ports that report "no device".
+ * With this xhci_init completes (instead of faulting on a zero CAPLENGTH) and
+ * the boot proceeds; device enumeration later just finds an empty root hub.
+ *
+ * CAPLENGTH 0x40, so operational regs at +0x40; DBOFF 0x800; RTSOFF 0x1000.
+ */
+#define XHCI_OP        0x40         /* CAPLENGTH: operational regs offset */
+#define XHCI_DBOFF     0x800
+#define XHCI_RTSOFF    0x1000
+#define XHCI_CMD_RS    (1u << 0)
+#define XHCI_CMD_HCRST (1u << 1)
+#define XHCI_STS_HCH   (1u << 0)    /* host controller halted */
+
+typedef struct TitaniumXHCI {
+    MemoryRegion mr;
+    qemu_irq irq;
+    uint32_t regs[0x2000 / 4];      /* backing store for RW registers */
+    uint32_t usbcmd;
+} TitaniumXHCI;
+
+static uint64_t titanium_xhci_read(void *opaque, hwaddr off, unsigned size)
+{
+    TitaniumXHCI *s = opaque;
+    uint32_t o = off & 0x1fff;
+
+    switch (o) {
+    /* --- capability registers --- */
+    case 0x00: return (0x0100u << 16) | XHCI_OP;   /* HCIVERSION 1.0 | CAPLENGTH */
+    case 0x04: return (2u << 24) | (1u << 8) | 32; /* HCSPARAMS1: 2 ports,1 intr,32 slots */
+    case 0x08: return 0;                            /* HCSPARAMS2: no scratchpad */
+    case 0x0c: return 0;                            /* HCSPARAMS3 */
+    case 0x10: return 1;                            /* HCCPARAMS: AC64=1, no xECP */
+    case 0x14: return XHCI_DBOFF;                   /* DBOFF */
+    case 0x18: return XHCI_RTSOFF;                  /* RTSOFF */
+    case 0x1c: return 0;                            /* HCCPARAMS2 */
+    /* --- operational registers (base + 0x40) --- */
+    case XHCI_OP + 0x00: return s->usbcmd;          /* USBCMD */
+    case XHCI_OP + 0x04:                            /* USBSTS: HCH = !RS, CNR=0 */
+        return (s->usbcmd & XHCI_CMD_RS) ? 0 : XHCI_STS_HCH;
+    case XHCI_OP + 0x08: return 1;                  /* PAGESIZE: 4 KiB */
+    default:
+        /* Root-hub port status: powered, no device connected (CCS=0). */
+        if (o >= XHCI_OP + 0x3F0 && o < XHCI_OP + 0x500 &&
+            ((o - (XHCI_OP + 0x3F0)) & 0xf) == 0) {
+            return (1u << 9) | (5u << 5);           /* PP=1, PLS=RxDetect */
+        }
+        return s->regs[o / 4];
+    }
+}
+
+static void titanium_xhci_write(void *opaque, hwaddr off, uint64_t val,
+                                unsigned size)
+{
+    TitaniumXHCI *s = opaque;
+    uint32_t o = off & 0x1fff;
+
+    switch (o) {
+    case XHCI_OP + 0x00:                            /* USBCMD: HCRST self-clears */
+        s->usbcmd = (uint32_t)val & ~XHCI_CMD_HCRST;
+        break;
+    case XHCI_OP + 0x04:                            /* USBSTS: W1C, nothing latched */
+        break;
+    default:
+        if (o < sizeof(s->regs)) {
+            s->regs[o / 4] = (uint32_t)val;
+        }
+        break;
+    }
+}
+
+static const MemoryRegionOps titanium_xhci_ops = {
+    .read = titanium_xhci_read,
+    .write = titanium_xhci_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
+static void titanium_xhci_init(MemoryRegion *sysmem, hwaddr base,
+                               const char *name, qemu_irq irq)
+{
+    TitaniumXHCI *s = g_new0(TitaniumXHCI, 1);
+    s->irq = irq;
+    memory_region_init_io(&s->mr, NULL, &titanium_xhci_ops, s, name, 0x2000);
+    memory_region_add_subregion_overlap(sysmem, base, &s->mr, 0);
+}
+
+/*
  * OMAP UART extension registers (above the 16550 core at offset 0x20).
  *
  * The 16550-compatible part (RHR/THR/IER/LCR/LSR/... at 0x00-0x1C) is handled
@@ -815,6 +911,11 @@ static void titanium_init(MachineState *machine)
     titanium_timer_init(sysmem, 0x4803E000, "titanium.timer9",  pic[45]);
     titanium_timer_init(sysmem, 0x48086000, "titanium.timer10", pic[46]);
     titanium_timer_init(sysmem, 0x48088000, "titanium.timer11", pic[47]);
+
+    /* xHCI USB host controllers (host side of the DWC3 cores). USB1 core at
+     * 0x48890000, USB2 at 0x488D0000; IRQs from HAL DevNoUSB0/1 (76/78). */
+    titanium_xhci_init(sysmem, 0x48890000, "titanium.xhci1", pic[76]);
+    titanium_xhci_init(sysmem, 0x488D0000, "titanium.xhci2", pic[78]);
 
     /* UART1 - the HAL's debug port (16550 core + OMAP extension registers) */
     titanium_uart_init(sysmem, TITANIUM_UART1_BASE,

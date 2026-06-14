@@ -272,6 +272,37 @@ Error: DataAbort:Abort on data transfer at &FC1FED04
 `XHCIDriver` init faults (alignment fault, `DFSR 0x1`, data address `0xf8c90005`):
 the unmodelled xHCI capability registers read back as 0, so the driver
 miscomputes a register offset and makes an unaligned access. RISC OS catches the
-error and drops to the supervisor prompt. Next work: a minimal **xHCI USB host
-controller** model (sane CAPLENGTH/HCSPARAMS + "halted, no ports") so USB init
-completes and full boot continues.
+error and drops to the supervisor prompt.
+
+## FIXED: xHCI USB host controller (register model) - boot reaches the desktop modules
+
+The NetBSD-derived `xhci_init` (XHCIDriver) reads the capability registers to
+locate the operational/runtime/doorbell blocks, resets the controller
+(`USBCMD.HCRST`, self-clearing), waits for `CNR=0`, builds its command/event
+rings + DCBAA in DMA RAM, then runs the controller (`USBCMD.RS`) and returns -
+it issues no commands and waits for no events during init. So a register model
+suffices.
+
+Added an xHCI model for USB1 `0x48890000` and USB2 `0x488D0000` (the host side of
+the DWC3 cores; IRQs `DevNoUSB0/1` = 76/78):
+- Capability regs: `CAPLENGTH=0x40`, `HCIVERSION=0x0100`, `HCSPARAMS1` = 2 ports/
+  1 intr/32 slots, `HCCPARAMS` AC64 with no xECP, `DBOFF=0x800`, `RTSOFF=0x1000`.
+- Operational: `USBCMD` (HCRST self-clears), `USBSTS` (`HCH = !RS`, `CNR=0`),
+  `PAGESIZE=1`; other regs RW-stored (rings live in DDR).
+- Root ports report powered, no device connected (`CCS=0`).
+
+With it, `xhci_init` completes, `ModuleInitForKbdScan` finishes, and the boot
+runs into the **full module init and the desktop**:
+
+```
+XHCIDriver / InternationalKeyboard / mod init (kbdscan) done
+Reset CMOS / ReadDefaults / InitHostedDAs / MouseInit / ModuleInit
+WindowManager / TaskManager / Desktop / ScreenModes / GC320Video
+```
+
+### Current stopping point
+
+`GC320Video` (the Vivante GC320 2D GPU / video driver) spins during init - no
+data abort, just a SWI poll loop - waiting on the unmodelled GC320 at
+`0x59000000`. Next work: model enough of the GC320 (and/or the DSS path) for its
+init to complete, after which the DISPC framebuffer scan-out should show output.
