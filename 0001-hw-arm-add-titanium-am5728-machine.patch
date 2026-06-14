@@ -1173,10 +1173,10 @@ index 90e6c04..85ca229 100644
  system_ss.add(when: 'CONFIG_SSD0323', if_true: files('ssd0323.c'))
 diff --git a/hw/display/titanium_dispc.c b/hw/display/titanium_dispc.c
 new file mode 100644
-index 0000000..371bc78
+index 0000000..7109f69
 --- /dev/null
 +++ b/hw/display/titanium_dispc.c
-@@ -0,0 +1,390 @@
+@@ -0,0 +1,398 @@
 +/*
 + * TI AM5728 DSS / DISPC display controller — minimal framebuffer scan-out
 + * for the Elesar Titanium machine (RISC OS 5).
@@ -1426,13 +1426,21 @@ index 0000000..371bc78
 +                                          s->regs[R_GFX_BA_0],
 +                                          s->height, src_width);
 +        s->fbsection_valid = true;
-+        s->invalidate = 1;
 +    }
 +
++    /* Force a full redraw every frame: the framebuffer is plain DRAM whose
++     * dirty-page tracking we can't rely on, so dirty-only updates would leave
++     * the screen stuck on the first (boot) frame. A 640x480 redraw is cheap. */
 +    framebuffer_update_display(surface, &s->fbsection, s->width, s->height,
-+                               src_width, s->width * 4, 0, s->invalidate,
++                               src_width, s->width * 4, 0, 1 /* invalidate */,
 +                               fn, s, &first, &last);
-+    s->invalidate = 0;
++    if (getenv("TITANIUM_DISPC_TRACE")) {
++        static int once;
++        if (!once++) {
++            fprintf(stderr, "[dispc] gfx_update %ux%u bpp=%d ba=%08x first=%d last=%d\n",
++                    s->width, s->height, bpp, s->regs[R_GFX_BA_0], first, last);
++        }
++    }
 +    if (last >= first) {
 +        dpy_gfx_update(s->con, 0, first, s->width, last - first + 1);
 +    }

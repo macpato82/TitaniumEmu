@@ -247,13 +247,21 @@ static void dispc_gfx_update(void *opaque)
                                           s->regs[R_GFX_BA_0],
                                           s->height, src_width);
         s->fbsection_valid = true;
-        s->invalidate = 1;
     }
 
+    /* Force a full redraw every frame: the framebuffer is plain DRAM whose
+     * dirty-page tracking we can't rely on, so dirty-only updates would leave
+     * the screen stuck on the first (boot) frame. A 640x480 redraw is cheap. */
     framebuffer_update_display(surface, &s->fbsection, s->width, s->height,
-                               src_width, s->width * 4, 0, s->invalidate,
+                               src_width, s->width * 4, 0, 1 /* invalidate */,
                                fn, s, &first, &last);
-    s->invalidate = 0;
+    if (getenv("TITANIUM_DISPC_TRACE")) {
+        static int once;
+        if (!once++) {
+            fprintf(stderr, "[dispc] gfx_update %ux%u bpp=%d ba=%08x first=%d last=%d\n",
+                    s->width, s->height, bpp, s->regs[R_GFX_BA_0], first, last);
+        }
+    }
     if (last >= first) {
         dpy_gfx_update(s->con, 0, first, s->width, last - first + 1);
     }
