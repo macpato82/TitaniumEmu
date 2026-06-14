@@ -229,6 +229,37 @@ static uint64_t titanium_l4_read_impl(void *opaque, hwaddr off, unsigned size)
         }
     }
 
+    /*
+     * Device status registers that are read back as written config PLUS
+     * synthesised live-status bits - these must override the verbatim readback
+     * below. (Vivante GC320 GPU, SD PBIAS, OMAP HSMMC SYSCTL.)
+     */
+    {
+        uint32_t phys = 0x44000000 + (uint32_t)woff;
+        uint32_t stored = GPOINTER_TO_UINT(g_hash_table_lookup(s->regs, key));
+
+        if (phys == 0x59000004) {
+            return 0x7fffffff;          /* GC320 AQHiIdle: every block idle */
+        }
+        /* CTRL_CORE_CONTROL_PBIAS: SDCARD_BIAS_SUPPLY_HI_OUT (bit24) - SD supply good */
+        if (phys == 0x4A002E00) {
+            return stored | (1u << 24);
+        }
+        /* OMAP HSMMC SYSCTL (offset 0x22C, MMC1..4): reset bits (24-26) self-clear;
+           ICE (bit0) -> ICS (bit1) clock stable. */
+        if ((woff & 0xfff) == 0x22c &&
+            ((phys >= 0x4809C000 && phys < 0x4809D000) ||
+             (phys >= 0x480AD000 && phys < 0x480AE000) ||
+             (phys >= 0x480B4000 && phys < 0x480B5000) ||
+             (phys >= 0x480D1000 && phys < 0x480D2000))) {
+            stored &= ~(7u << 24);
+            if (stored & 0x1) {
+                stored |= 0x2;
+            }
+            return stored;
+        }
+    }
+
     /* Other written registers: return verbatim. */
     if (g_hash_table_contains(s->regs, key)) {
         return GPOINTER_TO_UINT(g_hash_table_lookup(s->regs, key));
@@ -272,17 +303,6 @@ static uint64_t titanium_l4_read_impl(void *opaque, hwaddr off, unsigned size)
                                         GUINT_TO_POINTER((guint)(woff - 4))));
         if (prev != 0) {
             return 1;
-        }
-    }
-
-    /*
-     * Vivante GC320 2D GPU (0x59000000). The GC320 video blob resets the GPU
-     * and polls AQHiIdle (0x04) for it to go idle. Report all blocks idle.
-     */
-    {
-        uint32_t phys = 0x44000000 + (uint32_t)woff;
-        if (phys == 0x59000004) {
-            return 0x7fffffff;   /* AQHiIdle: every module idle */
         }
     }
 
