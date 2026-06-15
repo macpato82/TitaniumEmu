@@ -1,8 +1,8 @@
 diff --git a/hw/arm/Kconfig b/hw/arm/Kconfig
-index 7877506..9a93929 100644
+index 7877506..e04011c 100644
 --- a/hw/arm/Kconfig
 +++ b/hw/arm/Kconfig
-@@ -271,6 +271,18 @@ config VERSATILE
+@@ -271,6 +271,19 @@ config VERSATILE
      select REALVIEW
      select USB_OHCI_SYSBUS
  
@@ -13,6 +13,7 @@ index 7877506..9a93929 100644
 +    select A15MPCORE
 +    select SERIAL_MM
 +    select TITANIUM_DISPC
++    select TITANIUM_CPSW
 +    select EDID
 +    select USB_XHCI_SYSBUS
 +    select USB_HID
@@ -35,10 +36,10 @@ index aeaf654..9a855a9 100644
  
 diff --git a/hw/arm/titanium.c b/hw/arm/titanium.c
 new file mode 100644
-index 0000000..cdd365d
+index 0000000..dcfc233
 --- /dev/null
 +++ b/hw/arm/titanium.c
-@@ -0,0 +1,1196 @@
+@@ -0,0 +1,1329 @@
 +/*
 + * Elesar Titanium machine model (TI AM5728, dual Cortex-A15) - EXPERIMENTAL
 + *
@@ -66,12 +67,14 @@ index 0000000..cdd365d
 +#include "hw/loader.h"
 +#include "hw/qdev-properties.h"
 +#include "system/reset.h"
++#include "system/runstate.h"
 +#include "qemu/error-report.h"
 +#include "hw/cpu/a15mpcore.h"
 +#include "hw/arm/machines-qom.h"
 +#include "hw/char/serial-mm.h"
 +#include "hw/intc/arm_gic_common.h"
 +#include "hw/irq.h"
++#include "net/net.h"
 +#include "qemu/timer.h"
 +#include "hw/display/edid.h"
 +#include "hw/usb/xhci.h"
@@ -184,6 +187,12 @@ index 0000000..cdd365d
 +        uint32_t phys = 0x44000000 + (uint32_t)(off & ~(hwaddr)3);
 +        if (phys >= 0x58000000 && phys < 0x58100000) {
 +            fprintf(stderr, "[hdmi] rd %08x -> %08x\n", phys, (unsigned)v);
++        }
++    }
++    if (getenv("TITANIUM_CPSW_TRACE")) {
++        uint32_t phys = 0x44000000 + (uint32_t)(off & ~(hwaddr)3);
++        if (phys >= 0x48484000 && phys < 0x48488000) {
++            fprintf(stderr, "[cpsw] rd %08x -> %08x\n", phys, (unsigned)v);
 +        }
 +    }
 +    return v;
@@ -398,6 +407,25 @@ index 0000000..cdd365d
 +            fprintf(stderr, "[hdmi] wr %08x <- %08x\n", phys, (unsigned)val);
 +        }
 +    }
++    if (getenv("TITANIUM_CPSW_TRACE")) {
++        uint32_t phys = 0x44000000 + (uint32_t)woff;
++        if (phys >= 0x48484000 && phys < 0x48488000) {
++            fprintf(stderr, "[cpsw] wr %08x <- %08x\n", phys, (unsigned)val);
++        }
++    }
++
++    /*
++     * PRM_RSTCTRL (0x4AE07D00): RISC OS writes RST_GLOBAL_WARM_SW (bit0) or
++     * RST_GLOBAL_COLD_SW (bit1) to reboot (Shutdown->Restart / Ctrl-Reset).
++     * Our PRCM stub otherwise absorbs it, leaving the CPU spinning -> freeze.
++     * Trigger a full QEMU system reset: ROMs reload, devices reset, the CPU
++     * restarts at the GP boot entry, and the file-backed CMOS (already flushed)
++     * is re-read so configured boot settings take effect.
++     */
++    if ((0x44000000 + (uint32_t)woff) == 0x4AE07D00 && (val & 0x3)) {
++        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
++        return;
++    }
 +
 +    /*
 +     * OMAP peripheral soft-reset, scoped to the L4_PER peripheral region
@@ -509,19 +537,53 @@ index 0000000..cdd365d
 +     * 7-bit slaves 0x50..0x57 = 8 blocks of 256 bytes; the byte address is
 +     * ((sa & 7) << 8) | offset, where offset is the 1-byte in-block address. */
 +    uint8_t mem[2048];
-+    uint8_t mem_addr;   /* in-block byte offset (auto-increments, wraps at 256) */
++    uint8_t mem_addr;   /* in-block byte offset set by the address phase */
++    uint16_t cmos_addr; /* FULL 11-bit byte address; auto-increments across blocks
++                         * (the 24C16 rolls the whole 2 KiB, not per-256B block, so
++                         * a single multi-hundred-byte read spans slaves 0x51..0x57) */
 +    uint8_t seg_byte;   /* byte index within the current write segment */
 +    const char *persist; /* host file backing mem[] (CMOS); NULL = volatile */
++    /* DS1307-compatible RTC at 7-bit slave 0x68 on bus 0 (HAL_Titanium s/RTC).
++     * 64 registers: 0..6 = BCD seconds/min/hour/dow/date/month/year, 7 = control,
++     * 8..63 = battery RAM. Same controller instance as the CMOS; selected by sa. */
++    uint8_t rtc[64];
 +} TitaniumI2C;
 +
-+/* Full byte address into the 2 KiB CMOS for the current slave + in-block offset. */
++/* Full byte address into the 2 KiB CMOS. The 11-bit counter (set from the slave's
++ * block bits + the in-block offset) auto-increments across the whole device, so a
++ * read/write that crosses a 256-byte block boundary advances into the next block -
++ * exactly as RISC OS expects when it reads 1792 bytes in one transfer from 0x51. */
 +static inline uint32_t titanium_cmos_addr(TitaniumI2C *s)
 +{
-+    return (((uint32_t)(s->sa & 7)) << 8) | s->mem_addr;
++    return s->cmos_addr & 0x7ff;
 +}
 +static inline bool titanium_is_cmos(TitaniumI2C *s)
 +{
 +    return !s->ddc && (s->sa & 0x78) == 0x50;   /* slaves 0x50..0x57 */
++}
++static inline bool titanium_is_rtc(TitaniumI2C *s)
++{
++    return !s->ddc && (s->sa & 0x7f) == 0x68;   /* DS1307 RTC */
++}
++
++/* Snapshot the host wall-clock into the DS1307 BCD time registers. Called when a
++ * read transfer to the RTC begins, so RISC OS always reads the current time. The
++ * RTC effectively mirrors the host clock (writes from the Time/Date plugin are
++ * accepted into rtc[] but overwritten on the next read). */
++static void titanium_rtc_latch(TitaniumI2C *s)
++{
++    time_t t = time(NULL);
++    struct tm tm;
++    localtime_r(&t, &tm);
++#define TI_BCD(n) ((uint8_t)((((n) / 10) << 4) | ((n) % 10)))
++    s->rtc[0] = TI_BCD(tm.tm_sec) & 0x7f;             /* CH=0: oscillator running */
++    s->rtc[1] = TI_BCD(tm.tm_min);
++    s->rtc[2] = TI_BCD(tm.tm_hour);                   /* bit6=0: 24-hour mode */
++    s->rtc[3] = (uint8_t)(tm.tm_wday == 0 ? 7 : tm.tm_wday); /* 1..7 */
++    s->rtc[4] = TI_BCD(tm.tm_mday);
++    s->rtc[5] = TI_BCD(tm.tm_mon + 1);
++    s->rtc[6] = TI_BCD(tm.tm_year % 100);
++#undef TI_BCD
 +}
 +
 +/* Persist the CMOS EEPROM to its host backing file so RISC OS configuration
@@ -605,9 +667,14 @@ index 0000000..cdd365d
 +        if (s->ddc && s->sa == 0x50) {
 +            return s->edid[s->edid_ptr++];   /* serve EDID to the DDC read */
 +        }
++        if (titanium_is_rtc(s)) {
++            uint8_t v = s->rtc[s->mem_addr & 0x3f];   /* DS1307 register read */
++            s->mem_addr = (s->mem_addr + 1) & 0x3f;   /* auto-increment, wraps at 64 */
++            return v;
++        }
 +        if (titanium_is_cmos(s)) {
 +            uint8_t v = s->mem[titanium_cmos_addr(s)];   /* 2KiB CMOS readback */
-+            s->mem_addr++;                                /* in-block auto-increment */
++            s->cmos_addr = (s->cmos_addr + 1) & 0x7ff;   /* advance across blocks */
 +            return v;
 +        }
 +        return 0xff;   /* blank device */
@@ -656,12 +723,22 @@ index 0000000..cdd365d
 +        }
 +        if (s->ddc && s->sa == 0x50) {
 +            s->edid_ptr = (uint8_t)val;   /* DDC read offset within the EDID */
++        } else if (titanium_is_rtc(s)) {
++            if (s->seg_byte == 0) {
++                s->mem_addr = (uint8_t)val & 0x3f;        /* register pointer */
++            } else {
++                s->rtc[s->mem_addr & 0x3f] = (uint8_t)val; /* set clock/RAM */
++                s->mem_addr = (s->mem_addr + 1) & 0x3f;
++            }
++            s->seg_byte++;
 +        } else if (titanium_is_cmos(s)) {
 +            if (s->seg_byte == 0) {
-+                s->mem_addr = (uint8_t)val;   /* in-block byte offset */
++                /* address phase: block bits from the slave + the in-block offset */
++                s->mem_addr = (uint8_t)val;
++                s->cmos_addr = (((uint16_t)(s->sa & 7)) << 8) | (uint8_t)val;
 +            } else {
 +                s->mem[titanium_cmos_addr(s)] = (uint8_t)val;  /* CMOS data */
-+                s->mem_addr++;                                  /* in-block auto-increment */
++                s->cmos_addr = (s->cmos_addr + 1) & 0x7ff;     /* advance across blocks */
 +                titanium_cmos_flush(s);                         /* persist if file-backed */
 +            }
 +            s->seg_byte++;
@@ -677,6 +754,9 @@ index 0000000..cdd365d
 +            s->active = true;
 +            s->is_rx = !(val & I2C_CON_TRX);
 +            s->seg_byte = 0;
++            if (titanium_is_rtc(s) && s->is_rx) {
++                titanium_rtc_latch(s);   /* fresh host time for this read */
++            }
 +            titanium_i2c_set_ready(s);
 +        }
 +        break;
@@ -731,6 +811,40 @@ index 0000000..cdd365d
 +            .refresh_rate = 60,
 +        };
 +        qemu_edid_generate(s->edid, sizeof(s->edid), &info);
++        /*
++         * qemu_edid_generate leaves two values that the RISC OS Screen-config
++         * plugin mishandles: the preferred (native) detailed-timing pixel clock
++         * comes out as a nonsense ~170 kHz instead of 148.5 MHz, and the monitor
++         * range-limits descriptor advertises maxed-out ranges (up to 160 kHz /
++         * 125 Hz / 2550 MHz). The plugin formats these into fixed-size string
++         * buffers; the garbage timing overflows a buffer and scribbles over
++         * adjacent pointers (incl. its Toolbox event-handler pointer), so the
++         * next Toolbox event jumps through a corrupted pointer and aborts.
++         * Patch the EDID to sane values and fix the block-0 checksum.
++         */
++        if (s->edid[0x36] | s->edid[0x37]) {     /* first DTD is a real timing */
++            s->edid[0x36] = 0x02;                /* pixel clock = 14850 * 10 kHz */
++            s->edid[0x37] = 0x3a;                /*            = 148.5 MHz       */
++        }
++        for (int d = 0x48; d <= 0x6c; d += 18) { /* find range-limits (0xFD) desc */
++            if (!s->edid[d] && !s->edid[d + 1] && s->edid[d + 3] == 0xfd) {
++                s->edid[d + 6] = 0x4b;           /* max vertical   = 75 Hz   */
++                s->edid[d + 8] = 0x55;           /* max horizontal = 85 kHz  */
++                s->edid[d + 9] = 0x11;           /* max pixel clock= 170 MHz */
++            }
++        }
++        s->edid[0x14] = 0xa1;                    /* digital, 8bpc, DVI (not DisplayPort) */
++        {
++            uint8_t sum = 0;
++            for (int k = 0; k < 127; k++) {
++                sum += s->edid[k];
++            }
++            s->edid[127] = (uint8_t)(0u - sum);  /* block-0 checksum: sum%256==0 */
++        }
++        if (getenv("TITANIUM_EDID_DUMP")) {
++            FILE *f = fopen(getenv("TITANIUM_EDID_DUMP"), "wb");
++            if (f) { fwrite(s->edid, 1, sizeof(s->edid), f); fclose(f); }
++        }
 +    }
 +    memory_region_init_io(&s->mr, NULL, &titanium_i2c_ops, s, name, 0x1000);
 +    /* Priority 0 overlaps (overrides) the L4 stub at -1 for this 4 KiB. */
@@ -1203,6 +1317,26 @@ index 0000000..cdd365d
 +        }
 +    }
 +
++    /* CPSW (GMAC_SW) Ethernet at 0x48484000. The AM5728 3-port gigabit switch
++     * RISC OS drives via its in-ROM EtherNIC_CPSW driver. Self-contained NIC
++     * model + 8 KiB CPPI descriptor SRAM at 0x48486000, bridged to the host
++     * with e.g.  -nic user,model=titanium-cpsw  (SLIRP NAT). IRQs are the four
++     * wrapper pulses DevNoGMAC..+3 (GIC SPI 114-117). */
++    {
++        DeviceState *cpsw = qdev_new("titanium-cpsw");
++        SysBusDevice *sbd = SYS_BUS_DEVICE(cpsw);
++        qemu_configure_nic_device(cpsw, true, NULL);
++        sysbus_realize_and_unref(sbd, &error_fatal);
++        memory_region_add_subregion_overlap(sysmem, 0x48484000,
++            sysbus_mmio_get_region(sbd, 0), 1);   /* register block */
++        memory_region_add_subregion_overlap(sysmem, 0x48486000,
++            sysbus_mmio_get_region(sbd, 1), 1);   /* CPPI descriptor SRAM */
++        sysbus_connect_irq(sbd, 0, pic[114]); /* DevNoGMACRxThresh */
++        sysbus_connect_irq(sbd, 1, pic[115]); /* DevNoGMACRxPulse  */
++        sysbus_connect_irq(sbd, 2, pic[116]); /* DevNoGMACTxPulse  */
++        sysbus_connect_irq(sbd, 3, pic[117]); /* DevNoGMACMiscPulse */
++    }
++
 +    /* UART1 - the HAL's debug port (16550 core + OMAP extension registers) */
 +    titanium_uart_init(sysmem, TITANIUM_UART1_BASE,
 +                       pic[TITANIUM_UART1_IRQ], serial_hd(0));
@@ -1264,10 +1398,10 @@ index 90e6c04..85ca229 100644
  system_ss.add(when: 'CONFIG_SSD0323', if_true: files('ssd0323.c'))
 diff --git a/hw/display/titanium_dispc.c b/hw/display/titanium_dispc.c
 new file mode 100644
-index 0000000..a734b0b
+index 0000000..f3e93d4
 --- /dev/null
 +++ b/hw/display/titanium_dispc.c
-@@ -0,0 +1,511 @@
+@@ -0,0 +1,643 @@
 +/*
 + * TI AM5728 DSS / DISPC display controller — minimal framebuffer scan-out
 + * for the Elesar Titanium machine (RISC OS 5).
@@ -1288,6 +1422,7 @@ index 0000000..a734b0b
 +
 +#include "qemu/osdep.h"
 +#include "qemu/module.h"
++#include "qemu/main-loop.h"
 +#include "qemu/timer.h"
 +#include "hw/sysbus.h"
 +#include "hw/irq.h"
@@ -1307,10 +1442,16 @@ index 0000000..a734b0b
 +#define R_IRQSTATUS      (0x18 / 4)
 +#define R_IRQENABLE      (0x1C / 4)
 +#define R_CONTROL1       (0x40 / 4)
++#define R_SIZE_DIG       (0x78 / 4)   /* digital/TV output size (HDMI path) */
 +#define R_SIZE_LCD       (0x7C / 4)
 +#define R_GFX_BA_0       (0x80 / 4)
 +#define R_GFX_SIZE       (0x8C / 4)
 +#define R_GFX_ATTRIBUTES (0xA0 / 4)
++#define R_VID1_BA        (0xBC / 4)   /* VID1 overlay = 2nd output's test card (Ti banner) */
++#define R_VID1_ATTRIBUTES (0xCC / 4)
++#define R_VID3_BA        (0x308 / 4)  /* VID3 overlay base: aliases the desktop fb at >8bpp */
++#define R_VID3_ATTRIBUTES (0x370 / 4) /* bit0 enable, bits[5:1] format (AM5728 TRM) */
++#define R_VID3_PICTURE_SIZE (0x394 / 4) /* VID3 source picture size = (W-1)|(H-1)<<16 */
 +
 +#define DISPC_IRQ_FRAMEDONE (1u << 0)
 +#define DISPC_IRQ_VSYNC     (1u << 1)
@@ -1332,6 +1473,9 @@ index 0000000..a734b0b
 +    uint32_t regs[0x1000 / 4];
 +    uint32_t palette[256];   /* CLUT8 palette (index -> 0x00RRGGBB), loaded via 0x630 */
 +    uint32_t width, height;
++    uint32_t active_size;    /* last-written SIZE_LCD/SIZE_DIG/GFX_SIZE = current mode */
++    uint32_t pend_w, pend_h; /* pending resize, applied on the main loop via resize_bh */
++    QEMUBH *resize_bh;
 +    bool fbsection_valid;
 +    int invalidate;
 +
@@ -1428,9 +1572,37 @@ index 0000000..a734b0b
 +{
 +    while (width--) {
 +        uint32_t v = ldl_le_p(s);
-+        uint8_t r = v & 0xff, g = (v >> 8) & 0xff, b = (v >> 16) & 0xff;
++        /* xRGB24-8888 (DISPC FORMAT 0x8): 0x00RRGGBB, R in bits 23:16. */
++        uint8_t r = (v >> 16) & 0xff, g = (v >> 8) & 0xff, b = v & 0xff;
 +        *(uint32_t *)d = rgb_to_pixel32(r, g, b);
 +        s += 4;
++        d += 4;
++    }
++}
++
++/* 15bpp xRGB/ARGB-1555 (DISPC FORMAT 0x7/0xF): bits 14:10 R, 9:5 G, 4:0 B. */
++static void draw_line15(void *opaque, uint8_t *d, const uint8_t *s,
++                        int width, int deststep)
++{
++    while (width--) {
++        uint16_t v = lduw_le_p(s);
++        uint8_t r = ((v >> 10) & 0x1f) << 3;
++        uint8_t g = ((v >> 5) & 0x1f) << 3;
++        uint8_t b = (v & 0x1f) << 3;
++        *(uint32_t *)d = rgb_to_pixel32(r, g, b);
++        s += 2;
++        d += 4;
++    }
++}
++
++/* 24bpp packed RGB24-888 (DISPC FORMAT 0x9): 3 bytes B,G,R per pixel. */
++static void draw_line24(void *opaque, uint8_t *d, const uint8_t *s,
++                        int width, int deststep)
++{
++    while (width--) {
++        uint8_t b = s[0], g = s[1], r = s[2];
++        *(uint32_t *)d = rgb_to_pixel32(r, g, b);
++        s += 3;
 +        d += 4;
 +    }
 +}
@@ -1472,25 +1644,85 @@ index 0000000..a734b0b
 +           s->regs[R_GFX_BA_0] != 0;
 +}
 +
-+static void dispc_update_geometry(TitaniumDISPCState *s)
++/*
++ * Apply a pending mode resize on the main loop (scheduled via resize_bh).
++ * qemu_console_resize() must NOT run on the vCPU thread (from a register write)
++ * nor re-entrantly during the display refresh (from gfx_update): both leave SDL
++ * rendering a black/stale surface. Running it from a bottom-half on the main
++ * loop, at a safe point, works for both SDL and VNC.
++ */
++static void dispc_resize_bh(void *opaque)
 +{
-+    uint32_t sz = s->regs[R_GFX_SIZE];
++    TitaniumDISPCState *s = opaque;
++
++    if (s->pend_w > 1 && s->pend_h > 1 &&
++        (s->pend_w != s->width || s->pend_h != s->height)) {
++        s->width = s->pend_w;
++        s->height = s->pend_h;
++        s->fbsection_valid = false;
++        s->invalidate = 1;
++        qemu_console_resize(s->con, s->width, s->height);
++    }
++}
++
++/* Is VID3 the active layer aliasing the desktop framebuffer at >8bpp?
++ *
++ * VID3 counts as the >8bpp desktop overlay when it is enabled, aliases the GFX
++ * framebuffer base, and carries a genuine RGB FORMAT.  The FORMAT field is what
++ * separates the two modes RISC OS actually produces - confirmed on hardware
++ * registers:
++ *   - 16M-colour: VID3 FORMAT = 0x8 (xRGB8888) -> genuine 32bpp, scan VID3.
++ *   - 256-colour: VID3 left enabled aliasing the 8bpp GFX framebuffer but with
++ *     FORMAT = 0x10 (and a degenerate VID3_SIZE 1x129).  This must NOT be taken
++ *     as 32bpp or the 8bpp desktop renders as a 4x-repeated band; the GFX CLUT8
++ *     path is correct here.
++ * NOTE: VID3 PICTURE_SIZE (0x394) is the full screen resolution in BOTH cases,
++ * so ONLY the FORMAT distinguishes them - 0x10 is deliberately excluded. */
++static bool dispc_vid3_active(TitaniumDISPCState *s)
++{
++    uint32_t v3 = s->regs[R_VID3_ATTRIBUTES];
++    uint32_t f = (v3 >> 1) & 0x1f;
++    bool rgb = (f == 0x6 || f == 0x7 || f == 0x8 || f == 0x9 || f == 0xc ||
++                f == 0xd || f == 0xe || f == 0xf);
++    return (v3 & 1) && s->regs[R_VID3_BA] == s->regs[R_GFX_BA_0] &&
++           s->regs[R_GFX_BA_0] != 0 && rgb;
++}
++
++/* The source picture size to scan out (VID3 PICTURE_SIZE when aliasing). */
++static uint32_t dispc_source_size(TitaniumDISPCState *s)
++{
++    if (dispc_vid3_active(s)) {
++        uint32_t psz = s->regs[R_VID3_PICTURE_SIZE];
++        if ((psz & 0x7ff) && ((psz >> 16) & 0x7ff)) {
++            return psz;
++        }
++    }
++    return s->active_size;
++}
++
++static void dispc_update_geometry(TitaniumDISPCState *s, uint32_t sz)
++{
++    /* sz is the SOURCE picture size to scan out: VID3 PICTURE_SIZE when the
++     * desktop is aliased through VID3, otherwise the last-programmed panel SIZE
++     * (SIZE_DIG 0x78 / SIZE_LCD 0x7C tracked in active_size). Using the source
++     * size - not the panel size - matters when RISC OS runs a smaller desktop
++     * (e.g. 640x480) inside a larger output raster (e.g. 800x600): scanning the
++     * 640-wide framebuffer at 800 wide sheared the image. */
 +    uint32_t w = (sz & 0x7ff) + 1;
 +    uint32_t h = ((sz >> 16) & 0x7ff) + 1;
 +
-+    if (w <= 1 || h <= 1) {     /* GFX_SIZE unset: use the LCD panel size */
++    if (w <= 1 || h <= 1) {     /* nothing programmed yet: fall back to SIZE_LCD */
 +        uint32_t lcd = s->regs[R_SIZE_LCD];
 +        w = (lcd & 0x7ff) + 1;
 +        h = ((lcd >> 16) & 0x7ff) + 1;
 +    }
 +
-+    if (w != s->width || h != s->height) {
-+        s->width = w;
-+        s->height = h;
-+        s->fbsection_valid = false;
-+        if (w > 1 && h > 1) {
-+            qemu_console_resize(s->con, w, h);
-+        }
++    /* Defer the actual resize to the main loop (see dispc_resize_bh). */
++    if (w > 1 && h > 1 && (w != s->width || h != s->height) &&
++        (w != s->pend_w || h != s->pend_h)) {
++        s->pend_w = w;
++        s->pend_h = h;
++        qemu_bh_schedule(s->resize_bh);
 +    }
 +}
 +
@@ -1498,11 +1730,36 @@ index 0000000..a734b0b
 +{
 +    TitaniumDISPCState *s = opaque;
 +    DisplaySurface *surface;
-+    uint32_t fmt = (s->regs[R_GFX_ATTRIBUTES] >> GFX_ATTR_FORMAT_SHIFT) &
-+                   GFX_ATTR_FORMAT_MASK;
-+    /* fmt: 0x6 = RGB16; 0x8/0x9/0xC/0xD = 32bpp; else (0..3) = CLUT8/8bpp */
-+    int bpp = (fmt == 0x6) ? 2 : (fmt >= 0x8) ? 4 : 1;
-+    drawfn fn = (bpp == 1) ? draw_line8 : (bpp == 2) ? draw_line16 : draw_line32;
++    /*
++     * The RISC OS desktop framebuffer is always GFX_BA (output 1). At higher
++     * colour depths the VID3 overlay (0x370/0x308) ALIASES that same framebuffer
++     * carrying the real RGB format, while the GFX layer stays format-0 (8bpp
++     * CLUT for 256-colour). VID1 (0xBC) is the SECOND output's test card (the
++     * Elesar "Ti" banner) and must NEVER be read. So: always scan GFX_BA, but
++     * take the pixel format from VID3 when it is enabled, aliases GFX_BA, and
++     * carries an RGB format; otherwise from the GFX layer.
++     */
++    /* The VID overlay FORMAT field is 5 bits [5:1]: RISC OS uses 0x8 (xRGB8888)
++     * for genuine 32bpp.  dispc_vid3_active() also checks VID3 has a real picture
++     * size, so a 256-colour mode (VID3 left enabled at FORMAT 0x10 over a
++     * degenerate region) correctly falls through to the GFX CLUT8 path. */
++    uint32_t fmt;
++    int bpp;
++    drawfn fn;
++
++    if (dispc_vid3_active(s)) {
++        fmt = (s->regs[R_VID3_ATTRIBUTES] >> 1) & 0x1f; /* desktop aliased at >8bpp */
++    } else {
++        fmt = (s->regs[R_GFX_ATTRIBUTES] >> 1) & 0x1f;  /* GFX layer (8bpp CLUT)   */
++    }
++    switch (fmt) {
++    case 0x6:                               bpp = 2; fn = draw_line16; break; /* RGB565   */
++    case 0x7: case 0xf:                     bpp = 2; fn = draw_line15; break; /* xRGB1555 */
++    case 0x9:                               bpp = 3; fn = draw_line24; break; /* RGB24    */
++    case 0x8: case 0xc: case 0xd: case 0xe: case 0x10:
++                                            bpp = 4; fn = draw_line32; break; /* 32bpp    */
++    default:                                bpp = 1; fn = draw_line8;  break; /* 8bpp CLUT*/
++    }
 +    int src_width, dstride, y;
 +    int en = dispc_enabled(s);
 +    uint8_t *src, *dst;
@@ -1510,7 +1767,7 @@ index 0000000..a734b0b
 +    if (!en) {
 +        return;
 +    }
-+    dispc_update_geometry(s);
++    dispc_update_geometry(s, dispc_source_size(s));
 +    if (s->width <= 1 || s->height <= 1) {
 +        return;
 +    }
@@ -1694,14 +1951,20 @@ index 0000000..a734b0b
 +
 +    /* Any change to enable/geometry/base may change the picture */
 +    switch (addr >> 2) {
++    case R_SIZE_LCD:
++    case R_SIZE_DIG:
++    case R_GFX_SIZE:
++        if ((uint32_t)val) {
++            s->active_size = (uint32_t)val;   /* track the current mode's size */
++        }
++        /* fall through */
 +    case R_CONTROL1:
 +    case R_GFX_BA_0:
-+    case R_GFX_SIZE:
 +    case R_GFX_ATTRIBUTES:
 +        s->fbsection_valid = false;
 +        s->invalidate = 1;
 +        if (s->con) {
-+            dispc_update_geometry(s);
++            dispc_update_geometry(s, dispc_source_size(s));
 +        }
 +        break;
 +    default:
@@ -1731,11 +1994,13 @@ index 0000000..a734b0b
 +    sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
 +    sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
 +    s->con = graphic_console_init(dev, 0, &dispc_gfx_ops, s);
-+    /* Size the console once, here, so the display backend binds to a stable
-+     * surface. Resizing from inside gfx_update (which runs during the backend's
-+     * own refresh) is re-entrant and leaves SDL rendering a stale surface. */
-+    s->width = 640;
-+    s->height = 480;
++    /* Mode-change resizes are deferred to this bottom-half so qemu_console_resize
++     * runs on the main loop (safe for SDL); see dispc_resize_bh. The initial size
++     * is set directly here, during init on the main thread. */
++    s->resize_bh = qemu_bh_new_guarded(dispc_resize_bh, s,
++                                       &dev->mem_reentrancy_guard);
++    s->width = s->pend_w = 640;
++    s->height = s->pend_h = 480;
 +    qemu_console_resize(s->con, s->width, s->height);
 +    s->vsync = timer_new_ns(QEMU_CLOCK_VIRTUAL, dispc_vsync_tick, s);
 +    timer_mod(s->vsync, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
@@ -1753,6 +2018,7 @@ index 0000000..a734b0b
 +        s->palette[i] = (i << 16) | (i << 8) | i;
 +    }
 +    s->width = s->height = 0;
++    s->pend_w = s->pend_h = 0;
 +    s->fbsection_valid = false;
 +    s->invalidate = 1;
 +}
@@ -1779,3 +2045,633 @@ index 0000000..a734b0b
 +}
 +
 +type_init(titanium_dispc_register_types)
+diff --git a/hw/ide/ahci.c b/hw/ide/ahci.c
+index 14bc66f..f24a6c5 100644
+--- a/hw/ide/ahci.c
++++ b/hw/ide/ahci.c
+@@ -1200,7 +1200,18 @@ static void handle_reg_h2d_fis(AHCIState *s, int port,
+     AHCIDevice *ad = &s->dev[port];
+     uint16_t opts = le16_to_cpu(cmd->opts);
+ 
+-    if (cmd_fis[1] & 0x0F) {
++    /*
++     * QEMU does not model port multipliers. However, AHCI HBAs (and the RISC OS
++     * Titanium SATADriver) enumerate by sending a soft reset to the port-
++     * multiplier control port (PMP 15); with a single directly-attached device
++     * the HBA forwards this to that device and returns its signature. Mirror
++     * that: let a soft-reset *control* FIS (command-register-update bit clear)
++     * addressed to any PMP reach our single device so the reset/signature
++     * handshake completes. Still drop actual command FISes aimed at a nonzero
++     * PMP, which we cannot service.
++     */
++    if ((cmd_fis[1] & 0x0F) &&
++        (cmd_fis[1] & SATA_FIS_REG_H2D_UPDATE_COMMAND_REGISTER)) {
+         trace_handle_reg_h2d_fis_pmp(s, port, cmd_fis[1],
+                                      cmd_fis[2], cmd_fis[3]);
+         return;
+diff --git a/hw/net/Kconfig b/hw/net/Kconfig
+index 2b513d6..aa450d2 100644
+--- a/hw/net/Kconfig
++++ b/hw/net/Kconfig
+@@ -160,3 +160,6 @@ config CAN_CTUCANFD_PCI
+     default y if PCI_DEVICES
+     depends on PCI && CAN_CTUCANFD
+     select CAN_BUS
++
++config TITANIUM_CPSW
++    bool
+diff --git a/hw/net/meson.build b/hw/net/meson.build
+index 913eaed..fdcb5ba 100644
+--- a/hw/net/meson.build
++++ b/hw/net/meson.build
+@@ -1,3 +1,4 @@
++system_ss.add(when: 'CONFIG_TITANIUM_CPSW', if_true: files('titanium_cpsw.c'))
+ system_ss.add(when: 'CONFIG_DP8393X', if_true: files('dp8393x.c'))
+ system_ss.add(when: 'CONFIG_XEN_BUS', if_true: files('xen_nic.c'))
+ system_ss.add(when: 'CONFIG_NE2000_COMMON', if_true: files('ne2000.c'))
+diff --git a/hw/net/titanium_cpsw.c b/hw/net/titanium_cpsw.c
+new file mode 100644
+index 0000000..bcd9834
+--- /dev/null
++++ b/hw/net/titanium_cpsw.c
+@@ -0,0 +1,580 @@
++/*
++ * TI AM5728 CPSW (GMAC_SW) 3-port gigabit Ethernet switch - minimal model.
++ *
++ * Models enough of the classic cpsw_3g IP (the same block as AM335x/DRA7) for
++ * the RISC OS "EtherNIC_CPSW" driver on the Elesar Titanium to bring the link
++ * up and move packets:  the SS/PORT/CPDMA/STATERAM/ALE/SL/MDIO/WR register
++ * blocks, one host CPDMA channel pair (TX0/RX0) using CPPI descriptors in the
++ * 8 KiB descriptor SRAM, an always-link-up MDIO PHY, and the wrapper RX/TX
++ * pulse interrupts.  The wire side is a standard QEMU NIC, so attaching
++ *   -nic user,model=titanium-cpsw
++ * bridges RISC OS to the host via SLIRP NAT.
++ *
++ * Register map / descriptor layout per AM572x TRM (SPRUHZ6K) section 24.11.
++ *
++ * Base 0x48484000, 16 KiB:  registers 0x48484000..0x48486000, then the
++ * CPPI descriptor RAM 0x48486000..0x48488000.
++ */
++
++#include "qemu/osdep.h"
++#include "hw/sysbus.h"
++#include "hw/irq.h"
++#include "hw/qdev-properties.h"
++#include "migration/vmstate.h"
++#include "qapi/error.h"
++#include "qemu/log.h"
++#include "qemu/module.h"
++#include "system/dma.h"
++#include "net/net.h"
++#include "net/eth.h"
++
++#define TYPE_TITANIUM_CPSW "titanium-cpsw"
++OBJECT_DECLARE_SIMPLE_TYPE(TitaniumCPSWState, TITANIUM_CPSW)
++
++#define CPSW_REG_SIZE   0x2000          /* register window (SS..WR)        */
++#define CPSW_RAM_SIZE   0x2000          /* CPPI descriptor SRAM, 8 KiB     */
++#define CPSW_RAM_BASE   0x48486000      /* absolute base of the descr. RAM */
++
++/* --- register offsets (relative to 0x48484000) ----------------------------*/
++/* SS - subsystem / switch control */
++#define R_CPSW_ID_VER       0x000
++#define R_CPSW_CONTROL      0x004
++#define R_CPSW_SOFT_RESET   0x008
++#define R_CPSW_STAT_PORT_EN 0x00C
++#define R_CPSW_PTYPE        0x010
++/* CPDMA control (base 0x800) */
++#define R_TX_IDVER          0x800
++#define R_TX_CONTROL        0x804       /* bit0 TX_EN */
++#define R_TX_TEARDOWN       0x808
++#define R_RX_IDVER          0x810
++#define R_RX_CONTROL        0x814       /* bit0 RX_EN */
++#define R_RX_TEARDOWN       0x818
++#define R_CPDMA_SOFT_RESET  0x81C
++#define R_DMACONTROL        0x820
++#define R_DMASTATUS         0x824
++#define R_RX_BUFFER_OFFSET  0x828
++#define R_TX_INTSTAT_RAW    0x880
++#define R_TX_INTSTAT_MASKED 0x884
++#define R_TX_INTMASK_SET    0x888
++#define R_TX_INTMASK_CLEAR  0x88C
++#define R_CPDMA_IN_VECTOR   0x890
++#define R_CPDMA_EOI_VECTOR  0x894
++#define R_RX_INTSTAT_RAW    0x8A0
++#define R_RX_INTSTAT_MASKED 0x8A4
++#define R_RX_INTMASK_SET    0x8A8
++#define R_RX_INTMASK_CLEAR  0x8AC
++#define R_DMA_INTSTAT_RAW   0x8B0
++#define R_DMA_INTSTAT_MASKED 0x8B4
++#define R_DMA_INTMASK_SET   0x8B8
++#define R_DMA_INTMASK_CLEAR 0x8BC
++/* STATERAM (base 0xA00): per-channel head-descriptor and completion pointers */
++#define R_TX_HDP(n)         (0xA00 + 4 * (n))
++#define R_RX_HDP(n)         (0xA20 + 4 * (n))
++#define R_TX_CP(n)          (0xA40 + 4 * (n))
++#define R_RX_CP(n)          (0xA60 + 4 * (n))
++/* ALE (base 0xD00) */
++#define R_ALE_IDVER         0xD00
++#define R_ALE_CONTROL       0xD08
++/* CPGMAC_SL ports (base 0xD80 / 0xDC0) */
++#define R_SL1_IDVER         0xD80
++#define R_SL1_MACCONTROL    0xD84
++#define R_SL1_MACSTATUS     0xD88
++#define R_SL1_SOFT_RESET    0xD8C
++#define R_SL2_IDVER         0xDC0
++#define R_SL2_MACCONTROL    0xDC4
++#define R_SL2_MACSTATUS     0xDC8
++#define R_SL2_SOFT_RESET    0xDCC
++/* MDIO (base 0x1000) */
++#define R_MDIO_VER          0x1000
++#define R_MDIO_CONTROL      0x1004
++#define R_MDIO_ALIVE        0x1008
++#define R_MDIO_LINK         0x100C
++#define R_MDIO_USERACCESS0  0x1080
++#define R_MDIO_USERPHYSEL0  0x1084
++#define R_MDIO_USERACCESS1  0x1088
++#define R_MDIO_USERPHYSEL1  0x108C
++/* WR - wrapper / interrupt (base 0x1200) */
++#define R_WR_IDVER          0x1200
++#define R_WR_SOFT_RESET     0x1204
++#define R_WR_CONTROL        0x1208
++#define R_WR_INT_CONTROL    0x120C
++#define R_WR_C0_RX_THRESH_EN 0x1210
++#define R_WR_C0_RX_EN       0x1214
++#define R_WR_C0_TX_EN       0x1218
++#define R_WR_C0_MISC_EN     0x121C
++#define R_WR_C0_RX_THRESH_STAT 0x1240
++#define R_WR_C0_RX_STAT     0x1244
++#define R_WR_C0_TX_STAT     0x1248
++#define R_WR_C0_MISC_STAT   0x124C
++
++/* MDIO USERACCESS bit fields */
++#define MDIO_GO        (1u << 31)
++#define MDIO_WRITE     (1u << 30)
++#define MDIO_ACK       (1u << 29)
++#define MDIO_REGADR_SH 21
++#define MDIO_PHYADR_SH 16
++
++/* CPPI descriptor word3 flags */
++#define CPDMA_SOP      (1u << 31)
++#define CPDMA_EOP      (1u << 30)
++#define CPDMA_OWNER    (1u << 29)
++#define CPDMA_EOQ      (1u << 28)
++#define CPDMA_PKTLEN_MASK 0xFFFF
++
++#define CPSW_MAX_FRAME 9216
++
++struct TitaniumCPSWState {
++    SysBusDevice parent_obj;
++
++    MemoryRegion iomem;     /* register block */
++    MemoryRegion cppi_ram;  /* descriptor SRAM */
++    AddressSpace dma_as;
++    NICState *nic;
++    NICConf conf;
++
++    qemu_irq irq_rxthresh;  /* GIC SPI 114 */
++    qemu_irq irq_rx;        /* GIC SPI 115 */
++    qemu_irq irq_tx;        /* GIC SPI 116 */
++    qemu_irq irq_misc;      /* GIC SPI 117 */
++
++    uint32_t regs[CPSW_REG_SIZE / 4];
++
++    /* port-written completion-pointer values (compared against host acks) */
++    uint32_t tx_cp_portval;
++    uint32_t rx_cp_portval;
++
++    /* simple per-address MDIO PHY register file (32 regs) */
++    uint16_t phy_regs[32];
++
++    uint8_t frame[CPSW_MAX_FRAME];
++};
++
++/* ---- DMA helpers (descriptors live in the CPPI RAM mapped in dma_as) ----- */
++
++static uint32_t cpsw_ld32(TitaniumCPSWState *s, hwaddr addr)
++{
++    return address_space_ldl_le(&s->dma_as, addr, MEMTXATTRS_UNSPECIFIED, NULL);
++}
++
++static void cpsw_st32(TitaniumCPSWState *s, hwaddr addr, uint32_t val)
++{
++    address_space_stl_le(&s->dma_as, addr, val, MEMTXATTRS_UNSPECIFIED, NULL);
++}
++
++static int cpsw_trace = -1;
++#define CPSW_TRACE(...) \
++    do { if (cpsw_trace) { fprintf(stderr, "[cpsw] " __VA_ARGS__); } } while (0)
++static void cpsw_trace_init(void)
++{
++    if (cpsw_trace < 0) {
++        cpsw_trace = getenv("TITANIUM_CPSW_TRACE") ? 1 : 0;
++    }
++}
++
++/* ---- interrupt evaluation ------------------------------------------------ */
++
++static void cpsw_update_irqs(TitaniumCPSWState *s)
++{
++    bool tx = (s->regs[R_TX_INTSTAT_RAW / 4] & s->regs[R_TX_INTMASK_SET / 4] & 1)
++              && (s->regs[R_WR_C0_TX_EN / 4] & 1);
++    bool rx = (s->regs[R_RX_INTSTAT_RAW / 4] & s->regs[R_RX_INTMASK_SET / 4] & 1)
++              && (s->regs[R_WR_C0_RX_EN / 4] & 1);
++
++    s->regs[R_WR_C0_TX_STAT / 4] = tx ? 1 : 0;
++    s->regs[R_WR_C0_RX_STAT / 4] = rx ? 1 : 0;
++    s->regs[R_TX_INTSTAT_MASKED / 4] =
++        s->regs[R_TX_INTSTAT_RAW / 4] & s->regs[R_TX_INTMASK_SET / 4];
++    s->regs[R_RX_INTSTAT_MASKED / 4] =
++        s->regs[R_RX_INTSTAT_RAW / 4] & s->regs[R_RX_INTMASK_SET / 4];
++
++    qemu_set_irq(s->irq_tx, tx);
++    qemu_set_irq(s->irq_rx, rx);
++}
++
++/* ---- transmit ------------------------------------------------------------ */
++
++static void cpsw_transmit(TitaniumCPSWState *s)
++{
++    uint32_t desc = s->regs[R_TX_HDP(0) / 4];
++    uint32_t last = 0;
++    unsigned framelen = 0;
++
++    if (!(s->regs[R_TX_CONTROL / 4] & 1) || desc == 0) {
++        return;
++    }
++
++    while (desc != 0) {
++        uint32_t w0 = cpsw_ld32(s, desc + 0);   /* next      */
++        uint32_t w1 = cpsw_ld32(s, desc + 4);   /* buffer    */
++        uint32_t w2 = cpsw_ld32(s, desc + 8);   /* off|len   */
++        uint32_t w3 = cpsw_ld32(s, desc + 12);  /* flags|len */
++        uint32_t boff = (w2 >> 16) & 0xFFFF;
++        uint32_t blen = w2 & 0xFFFF;
++
++        if (blen && framelen + blen <= sizeof(s->frame)) {
++            address_space_read(&s->dma_as, w1 + boff, MEMTXATTRS_UNSPECIFIED,
++                               s->frame + framelen, blen);
++            framelen += blen;
++        }
++
++        /* hand the descriptor back to the host */
++        w3 &= ~CPDMA_OWNER;
++        if (w0 == 0) {
++            w3 |= CPDMA_EOQ;
++        }
++        cpsw_st32(s, desc + 12, w3);
++        last = desc;
++
++        if (w3 & CPDMA_EOP) {
++            CPSW_TRACE("TX %u bytes\n", framelen);
++            qemu_send_packet(qemu_get_queue(s->nic), s->frame, framelen);
++            framelen = 0;
++        }
++        desc = w0;
++    }
++
++    /* completion: port writes the last processed descriptor to TX0_CP */
++    s->tx_cp_portval = last;
++    s->regs[R_TX_CP(0) / 4] = last;
++    s->regs[R_TX_HDP(0) / 4] = 0;
++    s->regs[R_TX_INTSTAT_RAW / 4] |= 1;
++    cpsw_update_irqs(s);
++}
++
++/* ---- receive ------------------------------------------------------------- */
++
++static bool cpsw_can_receive(NetClientState *nc)
++{
++    TitaniumCPSWState *s = qemu_get_nic_opaque(nc);
++    return (s->regs[R_RX_CONTROL / 4] & 1) && s->regs[R_RX_HDP(0) / 4] != 0;
++}
++
++static ssize_t cpsw_receive(NetClientState *nc, const uint8_t *buf, size_t size)
++{
++    TitaniumCPSWState *s = qemu_get_nic_opaque(nc);
++    uint32_t desc = s->regs[R_RX_HDP(0) / 4];
++    uint32_t w0, w1, w2, w3, blen, boff;
++
++    if (!(s->regs[R_RX_CONTROL / 4] & 1) || desc == 0) {
++        return -1;          /* no buffer posted - ask the stack to requeue */
++    }
++    if (size > CPSW_MAX_FRAME) {
++        size = CPSW_MAX_FRAME;
++    }
++
++    w0 = cpsw_ld32(s, desc + 0);
++    w1 = cpsw_ld32(s, desc + 4);
++    w2 = cpsw_ld32(s, desc + 8);
++    w3 = cpsw_ld32(s, desc + 12);
++    boff = s->regs[R_RX_BUFFER_OFFSET / 4] & 0xFFFF;
++    blen = w2 & 0xFFFF;
++    if (size > blen) {
++        size = blen;
++    }
++
++    CPSW_TRACE("RX %zu bytes -> desc %08x buf %08x\n", size, desc, w1);
++    address_space_write(&s->dma_as, w1 + boff, MEMTXATTRS_UNSPECIFIED,
++                        buf, size);
++
++    /* fill the descriptor: SOP|EOP single-fragment, owner cleared, length */
++    w2 = (boff << 16) | (size & 0xFFFF);
++    w3 = CPDMA_SOP | CPDMA_EOP | (size & CPDMA_PKTLEN_MASK);
++    if (w0 == 0) {
++        w3 |= CPDMA_EOQ;
++    }
++    cpsw_st32(s, desc + 8, w2);
++    cpsw_st32(s, desc + 12, w3);
++
++    s->rx_cp_portval = desc;
++    s->regs[R_RX_CP(0) / 4] = desc;
++    s->regs[R_RX_HDP(0) / 4] = w0;          /* advance to next free buffer */
++    s->regs[R_RX_INTSTAT_RAW / 4] |= 1;
++    cpsw_update_irqs(s);
++    return size;
++}
++
++/* ---- MDIO ---------------------------------------------------------------- */
++
++static void cpsw_mdio_access(TitaniumCPSWState *s, uint32_t v)
++{
++    unsigned phy = (v >> MDIO_PHYADR_SH) & 0x1F;
++    unsigned reg = (v >> MDIO_REGADR_SH) & 0x1F;
++    uint32_t res;
++
++    /* the (single) PHY responds at every probed address: link is always up */
++    s->regs[R_MDIO_ALIVE / 4] |= (1u << phy);
++    s->regs[R_MDIO_LINK / 4]  |= (1u << phy);
++
++    if (v & MDIO_WRITE) {
++        s->phy_regs[reg] = v & 0xFFFF;
++        res = MDIO_ACK;                     /* GO cleared, ACK set */
++        CPSW_TRACE("MDIO wr phy%u reg%u = %04x\n", phy, reg, v & 0xFFFF);
++    } else {
++        res = MDIO_ACK | (s->phy_regs[reg] & 0xFFFF);
++        CPSW_TRACE("MDIO rd phy%u reg%u -> %04x\n", phy, reg, s->phy_regs[reg]);
++    }
++    s->regs[R_MDIO_USERACCESS0 / 4] = res;  /* GO bit cleared -> access done */
++}
++
++/* Micrel KSZ9031 vendor-specific PHY status (reg 31) bits - the EtherCPSW
++ * driver reads this for link/speed and treats "no speed bit" as link-down. */
++#define KSZ_VSPHYST     31
++#define KSZ_ST_LNKFAIL  0x0001
++#define KSZ_ST_DPLXDET  0x0008
++#define KSZ_ST_SPD1000  0x0040
++#define KSZ_VSPHYST_UP  (KSZ_ST_SPD1000 | KSZ_ST_DPLXDET) /* 1Gb full, link up */
++
++static void cpsw_phy_reset(TitaniumCPSWState *s)
++{
++    memset(s->phy_regs, 0, sizeof(s->phy_regs));
++    s->phy_regs[0]  = 0x1140;   /* BMCR:  autoneg enabled, 1000 Mbps          */
++    s->phy_regs[1]  = 0x796D;   /* BMSR:  link up, autoneg complete + caps    */
++    s->phy_regs[2]  = 0x0022;   /* PHYIDR1 (Micrel KSZ9031)                   */
++    s->phy_regs[3]  = 0x1622;   /* PHYIDR2 (Micrel KSZ9031)                   */
++    s->phy_regs[4]  = 0x01E1;   /* ANAR:  100/10 full/half advertised         */
++    s->phy_regs[5]  = 0xC1E1;   /* ANLPAR: link partner, autoneg ack          */
++    s->phy_regs[9]  = 0x0200;   /* 1000BASE-T control: 1000full advertised    */
++    s->phy_regs[10] = 0x7800;   /* 1000BASE-T status: LP 1000full capable     */
++    s->phy_regs[KSZ_VSPHYST] = KSZ_VSPHYST_UP;
++}
++
++/* ---- MMIO ---------------------------------------------------------------- */
++
++static uint64_t cpsw_read(void *opaque, hwaddr offset, unsigned size)
++{
++    TitaniumCPSWState *s = opaque;
++    uint32_t idx = (offset & ~3u) / 4;
++
++    switch (offset) {
++    case R_CPSW_ID_VER:   return 0x4EC81903; /* CPSW3G revision               */
++    case R_TX_IDVER:
++    case R_RX_IDVER:      return 0x000C0100;
++    case R_ALE_IDVER:     return 0x00290105;
++    case R_SL1_IDVER:
++    case R_SL2_IDVER:     return 0x4ED90101;
++    case R_MDIO_VER:      return 0x00070106;
++    case R_WR_IDVER:      return 0x00010700;
++    /* self-clearing soft-reset bits read back 0 */
++    case R_CPSW_SOFT_RESET:
++    case R_CPDMA_SOFT_RESET:
++    case R_SL1_SOFT_RESET:
++    case R_SL2_SOFT_RESET:
++    case R_WR_SOFT_RESET: return 0;
++    case R_DMASTATUS:     return 0;          /* idle, no errors               */
++    case R_SL1_MACSTATUS:
++    case R_SL2_MACSTATUS: return 0;
++    case R_CPDMA_IN_VECTOR:
++        return s->regs[R_TX_INTSTAT_MASKED / 4] ? (1u << 16) :
++               (s->regs[R_RX_INTSTAT_MASKED / 4] ? 1u : 0);
++    default:
++        if (idx < CPSW_REG_SIZE / 4) {
++            return s->regs[idx];
++        }
++        return 0;
++    }
++}
++
++static void cpsw_write(void *opaque, hwaddr offset, uint64_t val, unsigned size)
++{
++    TitaniumCPSWState *s = opaque;
++    uint32_t idx = (offset & ~3u) / 4;
++
++    switch (offset) {
++    /* soft resets self-clear: never store the set bit */
++    case R_CPSW_SOFT_RESET:
++    case R_CPDMA_SOFT_RESET:
++    case R_SL1_SOFT_RESET:
++    case R_SL2_SOFT_RESET:
++    case R_WR_SOFT_RESET:
++        return;
++
++    case R_TX_INTMASK_SET:
++        s->regs[idx] |= val; cpsw_update_irqs(s); return;
++    case R_TX_INTMASK_CLEAR:
++        s->regs[R_TX_INTMASK_SET / 4] &= ~(uint32_t)val;
++        cpsw_update_irqs(s); return;
++    case R_RX_INTMASK_SET:
++        s->regs[idx] |= val; cpsw_update_irqs(s); return;
++    case R_RX_INTMASK_CLEAR:
++        s->regs[R_RX_INTMASK_SET / 4] &= ~(uint32_t)val;
++        cpsw_update_irqs(s); return;
++
++    case R_CPDMA_EOI_VECTOR:
++        cpsw_update_irqs(s);
++        return;
++
++    case R_TX_HDP(0):
++        s->regs[idx] = val;
++        cpsw_transmit(s);
++        return;
++
++    case R_RX_HDP(0):
++        s->regs[idx] = val;
++        CPSW_TRACE("RX0_HDP posted = %08x\n", (uint32_t)val);
++        /* a freshly posted buffer may let queued RX frames flow */
++        if (cpsw_can_receive(qemu_get_queue(s->nic))) {
++            qemu_flush_queued_packets(qemu_get_queue(s->nic));
++        }
++        return;
++
++    case R_TX_CP(0):
++        /* host ack: deassert only when it matches the port-written value */
++        if ((uint32_t)val == s->tx_cp_portval) {
++            s->regs[R_TX_INTSTAT_RAW / 4] &= ~1u;
++            cpsw_update_irqs(s);
++        }
++        return;
++    case R_RX_CP(0):
++        if ((uint32_t)val == s->rx_cp_portval) {
++            s->regs[R_RX_INTSTAT_RAW / 4] &= ~1u;
++            cpsw_update_irqs(s);
++        }
++        return;
++
++    case R_RX_CONTROL:
++        s->regs[idx] = val;
++        CPSW_TRACE("RX_CONTROL = %08x\n", (uint32_t)val);
++        if ((val & 1) && cpsw_can_receive(qemu_get_queue(s->nic))) {
++            qemu_flush_queued_packets(qemu_get_queue(s->nic));
++        }
++        return;
++
++    case R_TX_CONTROL:
++        s->regs[idx] = val;
++        CPSW_TRACE("TX_CONTROL = %08x\n", (uint32_t)val);
++        return;
++
++    case R_MDIO_USERACCESS0:
++        if (val & MDIO_GO) {
++            cpsw_mdio_access(s, val);
++        } else {
++            s->regs[idx] = val;
++        }
++        return;
++
++    case R_WR_C0_TX_EN:
++    case R_WR_C0_RX_EN:
++        s->regs[idx] = val;
++        cpsw_update_irqs(s);
++        return;
++
++    default:
++        if (idx < CPSW_REG_SIZE / 4) {
++            s->regs[idx] = val;
++        }
++        return;
++    }
++}
++
++static const MemoryRegionOps cpsw_ops = {
++    .read = cpsw_read,
++    .write = cpsw_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .impl.min_access_size = 4,
++    .impl.max_access_size = 4,
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 4,
++};
++
++static void cpsw_set_link(NetClientState *nc)
++{
++    TitaniumCPSWState *s = qemu_get_nic_opaque(nc);
++    bool up = !nc->link_down;
++
++    s->phy_regs[1] = up ? 0x796D : 0x7809;       /* BMSR link-status bit  */
++    s->phy_regs[KSZ_VSPHYST] = up ? KSZ_VSPHYST_UP : KSZ_ST_LNKFAIL;
++    s->regs[R_MDIO_LINK / 4] = up ? 0xFFFFFFFF : 0;
++}
++
++static NetClientInfo net_cpsw_info = {
++    .type = NET_CLIENT_DRIVER_NIC,
++    .size = sizeof(NICState),
++    .can_receive = cpsw_can_receive,
++    .receive = cpsw_receive,
++    .link_status_changed = cpsw_set_link,
++};
++
++static void cpsw_reset_hold(Object *obj, ResetType type)
++{
++    TitaniumCPSWState *s = TITANIUM_CPSW(obj);
++
++    memset(s->regs, 0, sizeof(s->regs));
++    s->tx_cp_portval = 0;
++    s->rx_cp_portval = 0;
++    cpsw_phy_reset(s);
++    qemu_set_irq(s->irq_tx, 0);
++    qemu_set_irq(s->irq_rx, 0);
++    qemu_set_irq(s->irq_rxthresh, 0);
++    qemu_set_irq(s->irq_misc, 0);
++}
++
++static void cpsw_realize(DeviceState *dev, Error **errp)
++{
++    TitaniumCPSWState *s = TITANIUM_CPSW(dev);
++    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
++
++    memory_region_init_io(&s->iomem, OBJECT(s), &cpsw_ops, s,
++                          "titanium-cpsw.regs", CPSW_REG_SIZE);
++    sysbus_init_mmio(sbd, &s->iomem);
++
++    memory_region_init_ram(&s->cppi_ram, OBJECT(s), "titanium-cpsw.cppi",
++                           CPSW_RAM_SIZE, &error_fatal);
++    sysbus_init_mmio(sbd, &s->cppi_ram);
++
++    sysbus_init_irq(sbd, &s->irq_rxthresh);
++    sysbus_init_irq(sbd, &s->irq_rx);
++    sysbus_init_irq(sbd, &s->irq_tx);
++    sysbus_init_irq(sbd, &s->irq_misc);
++
++    address_space_init(&s->dma_as, get_system_memory(), "titanium-cpsw-dma");
++
++    cpsw_trace_init();
++    qemu_macaddr_default_if_unset(&s->conf.macaddr);
++    s->nic = qemu_new_nic(&net_cpsw_info, &s->conf,
++                          object_get_typename(OBJECT(dev)), dev->id,
++                          &dev->mem_reentrancy_guard, s);
++    qemu_format_nic_info_str(qemu_get_queue(s->nic), s->conf.macaddr.a);
++}
++
++static const VMStateDescription vmstate_cpsw = {
++    .name = "titanium-cpsw",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT32_ARRAY(regs, TitaniumCPSWState, CPSW_REG_SIZE / 4),
++        VMSTATE_UINT32(tx_cp_portval, TitaniumCPSWState),
++        VMSTATE_UINT32(rx_cp_portval, TitaniumCPSWState),
++        VMSTATE_UINT16_ARRAY(phy_regs, TitaniumCPSWState, 32),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
++static const Property cpsw_props[] = {
++    DEFINE_NIC_PROPERTIES(TitaniumCPSWState, conf),
++};
++
++static void cpsw_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    ResettableClass *rc = RESETTABLE_CLASS(klass);
++
++    dc->realize = cpsw_realize;
++    dc->vmsd = &vmstate_cpsw;
++    rc->phases.hold = cpsw_reset_hold;
++    device_class_set_props(dc, cpsw_props);
++    set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
++}
++
++static const TypeInfo cpsw_info = {
++    .name = TYPE_TITANIUM_CPSW,
++    .parent = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(TitaniumCPSWState),
++    .class_init = cpsw_class_init,
++};
++
++static void cpsw_register_types(void)
++{
++    type_register_static(&cpsw_info);
++}
++
++type_init(cpsw_register_types)

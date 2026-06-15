@@ -25,12 +25,14 @@
 #include "hw/loader.h"
 #include "hw/qdev-properties.h"
 #include "system/reset.h"
+#include "system/runstate.h"
 #include "qemu/error-report.h"
 #include "hw/cpu/a15mpcore.h"
 #include "hw/arm/machines-qom.h"
 #include "hw/char/serial-mm.h"
 #include "hw/intc/arm_gic_common.h"
 #include "hw/irq.h"
+#include "net/net.h"
 #include "qemu/timer.h"
 #include "hw/display/edid.h"
 #include "hw/usb/xhci.h"
@@ -143,6 +145,12 @@ static uint64_t titanium_l4_read(void *opaque, hwaddr off, unsigned size)
         uint32_t phys = 0x44000000 + (uint32_t)(off & ~(hwaddr)3);
         if (phys >= 0x58000000 && phys < 0x58100000) {
             fprintf(stderr, "[hdmi] rd %08x -> %08x\n", phys, (unsigned)v);
+        }
+    }
+    if (getenv("TITANIUM_CPSW_TRACE")) {
+        uint32_t phys = 0x44000000 + (uint32_t)(off & ~(hwaddr)3);
+        if (phys >= 0x48484000 && phys < 0x48488000) {
+            fprintf(stderr, "[cpsw] rd %08x -> %08x\n", phys, (unsigned)v);
         }
     }
     return v;
@@ -357,6 +365,25 @@ static void titanium_l4_write(void *opaque, hwaddr off, uint64_t val,
             fprintf(stderr, "[hdmi] wr %08x <- %08x\n", phys, (unsigned)val);
         }
     }
+    if (getenv("TITANIUM_CPSW_TRACE")) {
+        uint32_t phys = 0x44000000 + (uint32_t)woff;
+        if (phys >= 0x48484000 && phys < 0x48488000) {
+            fprintf(stderr, "[cpsw] wr %08x <- %08x\n", phys, (unsigned)val);
+        }
+    }
+
+    /*
+     * PRM_RSTCTRL (0x4AE07D00): RISC OS writes RST_GLOBAL_WARM_SW (bit0) or
+     * RST_GLOBAL_COLD_SW (bit1) to reboot (Shutdown->Restart / Ctrl-Reset).
+     * Our PRCM stub otherwise absorbs it, leaving the CPU spinning -> freeze.
+     * Trigger a full QEMU system reset: ROMs reload, devices reset, the CPU
+     * restarts at the GP boot entry, and the file-backed CMOS (already flushed)
+     * is re-read so configured boot settings take effect.
+     */
+    if ((0x44000000 + (uint32_t)woff) == 0x4AE07D00 && (val & 0x3)) {
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+        return;
+    }
 
     /*
      * OMAP peripheral soft-reset, scoped to the L4_PER peripheral region
@@ -468,19 +495,53 @@ typedef struct TitaniumI2C {
      * 7-bit slaves 0x50..0x57 = 8 blocks of 256 bytes; the byte address is
      * ((sa & 7) << 8) | offset, where offset is the 1-byte in-block address. */
     uint8_t mem[2048];
-    uint8_t mem_addr;   /* in-block byte offset (auto-increments, wraps at 256) */
+    uint8_t mem_addr;   /* in-block byte offset set by the address phase */
+    uint16_t cmos_addr; /* FULL 11-bit byte address; auto-increments across blocks
+                         * (the 24C16 rolls the whole 2 KiB, not per-256B block, so
+                         * a single multi-hundred-byte read spans slaves 0x51..0x57) */
     uint8_t seg_byte;   /* byte index within the current write segment */
     const char *persist; /* host file backing mem[] (CMOS); NULL = volatile */
+    /* DS1307-compatible RTC at 7-bit slave 0x68 on bus 0 (HAL_Titanium s/RTC).
+     * 64 registers: 0..6 = BCD seconds/min/hour/dow/date/month/year, 7 = control,
+     * 8..63 = battery RAM. Same controller instance as the CMOS; selected by sa. */
+    uint8_t rtc[64];
 } TitaniumI2C;
 
-/* Full byte address into the 2 KiB CMOS for the current slave + in-block offset. */
+/* Full byte address into the 2 KiB CMOS. The 11-bit counter (set from the slave's
+ * block bits + the in-block offset) auto-increments across the whole device, so a
+ * read/write that crosses a 256-byte block boundary advances into the next block -
+ * exactly as RISC OS expects when it reads 1792 bytes in one transfer from 0x51. */
 static inline uint32_t titanium_cmos_addr(TitaniumI2C *s)
 {
-    return (((uint32_t)(s->sa & 7)) << 8) | s->mem_addr;
+    return s->cmos_addr & 0x7ff;
 }
 static inline bool titanium_is_cmos(TitaniumI2C *s)
 {
     return !s->ddc && (s->sa & 0x78) == 0x50;   /* slaves 0x50..0x57 */
+}
+static inline bool titanium_is_rtc(TitaniumI2C *s)
+{
+    return !s->ddc && (s->sa & 0x7f) == 0x68;   /* DS1307 RTC */
+}
+
+/* Snapshot the host wall-clock into the DS1307 BCD time registers. Called when a
+ * read transfer to the RTC begins, so RISC OS always reads the current time. The
+ * RTC effectively mirrors the host clock (writes from the Time/Date plugin are
+ * accepted into rtc[] but overwritten on the next read). */
+static void titanium_rtc_latch(TitaniumI2C *s)
+{
+    time_t t = time(NULL);
+    struct tm tm;
+    localtime_r(&t, &tm);
+#define TI_BCD(n) ((uint8_t)((((n) / 10) << 4) | ((n) % 10)))
+    s->rtc[0] = TI_BCD(tm.tm_sec) & 0x7f;             /* CH=0: oscillator running */
+    s->rtc[1] = TI_BCD(tm.tm_min);
+    s->rtc[2] = TI_BCD(tm.tm_hour);                   /* bit6=0: 24-hour mode */
+    s->rtc[3] = (uint8_t)(tm.tm_wday == 0 ? 7 : tm.tm_wday); /* 1..7 */
+    s->rtc[4] = TI_BCD(tm.tm_mday);
+    s->rtc[5] = TI_BCD(tm.tm_mon + 1);
+    s->rtc[6] = TI_BCD(tm.tm_year % 100);
+#undef TI_BCD
 }
 
 /* Persist the CMOS EEPROM to its host backing file so RISC OS configuration
@@ -564,9 +625,14 @@ static uint64_t titanium_i2c_read_impl(void *opaque, hwaddr off, unsigned size)
         if (s->ddc && s->sa == 0x50) {
             return s->edid[s->edid_ptr++];   /* serve EDID to the DDC read */
         }
+        if (titanium_is_rtc(s)) {
+            uint8_t v = s->rtc[s->mem_addr & 0x3f];   /* DS1307 register read */
+            s->mem_addr = (s->mem_addr + 1) & 0x3f;   /* auto-increment, wraps at 64 */
+            return v;
+        }
         if (titanium_is_cmos(s)) {
             uint8_t v = s->mem[titanium_cmos_addr(s)];   /* 2KiB CMOS readback */
-            s->mem_addr++;                                /* in-block auto-increment */
+            s->cmos_addr = (s->cmos_addr + 1) & 0x7ff;   /* advance across blocks */
             return v;
         }
         return 0xff;   /* blank device */
@@ -615,12 +681,22 @@ static void titanium_i2c_write(void *opaque, hwaddr off, uint64_t val,
         }
         if (s->ddc && s->sa == 0x50) {
             s->edid_ptr = (uint8_t)val;   /* DDC read offset within the EDID */
+        } else if (titanium_is_rtc(s)) {
+            if (s->seg_byte == 0) {
+                s->mem_addr = (uint8_t)val & 0x3f;        /* register pointer */
+            } else {
+                s->rtc[s->mem_addr & 0x3f] = (uint8_t)val; /* set clock/RAM */
+                s->mem_addr = (s->mem_addr + 1) & 0x3f;
+            }
+            s->seg_byte++;
         } else if (titanium_is_cmos(s)) {
             if (s->seg_byte == 0) {
-                s->mem_addr = (uint8_t)val;   /* in-block byte offset */
+                /* address phase: block bits from the slave + the in-block offset */
+                s->mem_addr = (uint8_t)val;
+                s->cmos_addr = (((uint16_t)(s->sa & 7)) << 8) | (uint8_t)val;
             } else {
                 s->mem[titanium_cmos_addr(s)] = (uint8_t)val;  /* CMOS data */
-                s->mem_addr++;                                  /* in-block auto-increment */
+                s->cmos_addr = (s->cmos_addr + 1) & 0x7ff;     /* advance across blocks */
                 titanium_cmos_flush(s);                         /* persist if file-backed */
             }
             s->seg_byte++;
@@ -636,6 +712,9 @@ static void titanium_i2c_write(void *opaque, hwaddr off, uint64_t val,
             s->active = true;
             s->is_rx = !(val & I2C_CON_TRX);
             s->seg_byte = 0;
+            if (titanium_is_rtc(s) && s->is_rx) {
+                titanium_rtc_latch(s);   /* fresh host time for this read */
+            }
             titanium_i2c_set_ready(s);
         }
         break;
@@ -690,6 +769,40 @@ static void titanium_i2c_init(MemoryRegion *sysmem, hwaddr base,
             .refresh_rate = 60,
         };
         qemu_edid_generate(s->edid, sizeof(s->edid), &info);
+        /*
+         * qemu_edid_generate leaves two values that the RISC OS Screen-config
+         * plugin mishandles: the preferred (native) detailed-timing pixel clock
+         * comes out as a nonsense ~170 kHz instead of 148.5 MHz, and the monitor
+         * range-limits descriptor advertises maxed-out ranges (up to 160 kHz /
+         * 125 Hz / 2550 MHz). The plugin formats these into fixed-size string
+         * buffers; the garbage timing overflows a buffer and scribbles over
+         * adjacent pointers (incl. its Toolbox event-handler pointer), so the
+         * next Toolbox event jumps through a corrupted pointer and aborts.
+         * Patch the EDID to sane values and fix the block-0 checksum.
+         */
+        if (s->edid[0x36] | s->edid[0x37]) {     /* first DTD is a real timing */
+            s->edid[0x36] = 0x02;                /* pixel clock = 14850 * 10 kHz */
+            s->edid[0x37] = 0x3a;                /*            = 148.5 MHz       */
+        }
+        for (int d = 0x48; d <= 0x6c; d += 18) { /* find range-limits (0xFD) desc */
+            if (!s->edid[d] && !s->edid[d + 1] && s->edid[d + 3] == 0xfd) {
+                s->edid[d + 6] = 0x4b;           /* max vertical   = 75 Hz   */
+                s->edid[d + 8] = 0x55;           /* max horizontal = 85 kHz  */
+                s->edid[d + 9] = 0x11;           /* max pixel clock= 170 MHz */
+            }
+        }
+        s->edid[0x14] = 0xa1;                    /* digital, 8bpc, DVI (not DisplayPort) */
+        {
+            uint8_t sum = 0;
+            for (int k = 0; k < 127; k++) {
+                sum += s->edid[k];
+            }
+            s->edid[127] = (uint8_t)(0u - sum);  /* block-0 checksum: sum%256==0 */
+        }
+        if (getenv("TITANIUM_EDID_DUMP")) {
+            FILE *f = fopen(getenv("TITANIUM_EDID_DUMP"), "wb");
+            if (f) { fwrite(s->edid, 1, sizeof(s->edid), f); fclose(f); }
+        }
     }
     memory_region_init_io(&s->mr, NULL, &titanium_i2c_ops, s, name, 0x1000);
     /* Priority 0 overlaps (overrides) the L4 stub at -1 for this 4 KiB. */
@@ -1160,6 +1273,26 @@ static void titanium_init(MachineState *machine)
             hd[0] = drive_get(IF_IDE, 0, 0);
             ahci_ide_create_devs(&SYSBUS_AHCI(ahci)->ahci, hd);
         }
+    }
+
+    /* CPSW (GMAC_SW) Ethernet at 0x48484000. The AM5728 3-port gigabit switch
+     * RISC OS drives via its in-ROM EtherNIC_CPSW driver. Self-contained NIC
+     * model + 8 KiB CPPI descriptor SRAM at 0x48486000, bridged to the host
+     * with e.g.  -nic user,model=titanium-cpsw  (SLIRP NAT). IRQs are the four
+     * wrapper pulses DevNoGMAC..+3 (GIC SPI 114-117). */
+    {
+        DeviceState *cpsw = qdev_new("titanium-cpsw");
+        SysBusDevice *sbd = SYS_BUS_DEVICE(cpsw);
+        qemu_configure_nic_device(cpsw, true, NULL);
+        sysbus_realize_and_unref(sbd, &error_fatal);
+        memory_region_add_subregion_overlap(sysmem, 0x48484000,
+            sysbus_mmio_get_region(sbd, 0), 1);   /* register block */
+        memory_region_add_subregion_overlap(sysmem, 0x48486000,
+            sysbus_mmio_get_region(sbd, 1), 1);   /* CPPI descriptor SRAM */
+        sysbus_connect_irq(sbd, 0, pic[114]); /* DevNoGMACRxThresh */
+        sysbus_connect_irq(sbd, 1, pic[115]); /* DevNoGMACRxPulse  */
+        sysbus_connect_irq(sbd, 2, pic[116]); /* DevNoGMACTxPulse  */
+        sysbus_connect_irq(sbd, 3, pic[117]); /* DevNoGMACMiscPulse */
     }
 
     /* UART1 - the HAL's debug port (16550 core + OMAP extension registers) */

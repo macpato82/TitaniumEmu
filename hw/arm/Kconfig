@@ -278,6 +278,7 @@ config TITANIUM
     select A15MPCORE
     select SERIAL_MM
     select TITANIUM_DISPC
+    select TITANIUM_CPSW
     select EDID
     select USB_XHCI_SYSBUS
     select USB_HID

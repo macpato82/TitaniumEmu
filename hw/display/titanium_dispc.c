@@ -18,6 +18,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/module.h"
+#include "qemu/main-loop.h"
 #include "qemu/timer.h"
 #include "hw/sysbus.h"
 #include "hw/irq.h"
@@ -37,10 +38,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(TitaniumDISPCState, TITANIUM_DISPC)
 #define R_IRQSTATUS      (0x18 / 4)
 #define R_IRQENABLE      (0x1C / 4)
 #define R_CONTROL1       (0x40 / 4)
+#define R_SIZE_DIG       (0x78 / 4)   /* digital/TV output size (HDMI path) */
 #define R_SIZE_LCD       (0x7C / 4)
 #define R_GFX_BA_0       (0x80 / 4)
 #define R_GFX_SIZE       (0x8C / 4)
 #define R_GFX_ATTRIBUTES (0xA0 / 4)
+#define R_VID1_BA        (0xBC / 4)   /* VID1 overlay = 2nd output's test card (Ti banner) */
+#define R_VID1_ATTRIBUTES (0xCC / 4)
+#define R_VID3_BA        (0x308 / 4)  /* VID3 overlay base: aliases the desktop fb at >8bpp */
+#define R_VID3_ATTRIBUTES (0x370 / 4) /* bit0 enable, bits[5:1] format (AM5728 TRM) */
+#define R_VID3_PICTURE_SIZE (0x394 / 4) /* VID3 source picture size = (W-1)|(H-1)<<16 */
 
 #define DISPC_IRQ_FRAMEDONE (1u << 0)
 #define DISPC_IRQ_VSYNC     (1u << 1)
@@ -62,6 +69,9 @@ struct TitaniumDISPCState {
     uint32_t regs[0x1000 / 4];
     uint32_t palette[256];   /* CLUT8 palette (index -> 0x00RRGGBB), loaded via 0x630 */
     uint32_t width, height;
+    uint32_t active_size;    /* last-written SIZE_LCD/SIZE_DIG/GFX_SIZE = current mode */
+    uint32_t pend_w, pend_h; /* pending resize, applied on the main loop via resize_bh */
+    QEMUBH *resize_bh;
     bool fbsection_valid;
     int invalidate;
 
@@ -158,9 +168,37 @@ static void draw_line32(void *opaque, uint8_t *d, const uint8_t *s,
 {
     while (width--) {
         uint32_t v = ldl_le_p(s);
-        uint8_t r = v & 0xff, g = (v >> 8) & 0xff, b = (v >> 16) & 0xff;
+        /* xRGB24-8888 (DISPC FORMAT 0x8): 0x00RRGGBB, R in bits 23:16. */
+        uint8_t r = (v >> 16) & 0xff, g = (v >> 8) & 0xff, b = v & 0xff;
         *(uint32_t *)d = rgb_to_pixel32(r, g, b);
         s += 4;
+        d += 4;
+    }
+}
+
+/* 15bpp xRGB/ARGB-1555 (DISPC FORMAT 0x7/0xF): bits 14:10 R, 9:5 G, 4:0 B. */
+static void draw_line15(void *opaque, uint8_t *d, const uint8_t *s,
+                        int width, int deststep)
+{
+    while (width--) {
+        uint16_t v = lduw_le_p(s);
+        uint8_t r = ((v >> 10) & 0x1f) << 3;
+        uint8_t g = ((v >> 5) & 0x1f) << 3;
+        uint8_t b = (v & 0x1f) << 3;
+        *(uint32_t *)d = rgb_to_pixel32(r, g, b);
+        s += 2;
+        d += 4;
+    }
+}
+
+/* 24bpp packed RGB24-888 (DISPC FORMAT 0x9): 3 bytes B,G,R per pixel. */
+static void draw_line24(void *opaque, uint8_t *d, const uint8_t *s,
+                        int width, int deststep)
+{
+    while (width--) {
+        uint8_t b = s[0], g = s[1], r = s[2];
+        *(uint32_t *)d = rgb_to_pixel32(r, g, b);
+        s += 3;
         d += 4;
     }
 }
@@ -202,25 +240,85 @@ static bool dispc_enabled(TitaniumDISPCState *s)
            s->regs[R_GFX_BA_0] != 0;
 }
 
-static void dispc_update_geometry(TitaniumDISPCState *s)
+/*
+ * Apply a pending mode resize on the main loop (scheduled via resize_bh).
+ * qemu_console_resize() must NOT run on the vCPU thread (from a register write)
+ * nor re-entrantly during the display refresh (from gfx_update): both leave SDL
+ * rendering a black/stale surface. Running it from a bottom-half on the main
+ * loop, at a safe point, works for both SDL and VNC.
+ */
+static void dispc_resize_bh(void *opaque)
 {
-    uint32_t sz = s->regs[R_GFX_SIZE];
+    TitaniumDISPCState *s = opaque;
+
+    if (s->pend_w > 1 && s->pend_h > 1 &&
+        (s->pend_w != s->width || s->pend_h != s->height)) {
+        s->width = s->pend_w;
+        s->height = s->pend_h;
+        s->fbsection_valid = false;
+        s->invalidate = 1;
+        qemu_console_resize(s->con, s->width, s->height);
+    }
+}
+
+/* Is VID3 the active layer aliasing the desktop framebuffer at >8bpp?
+ *
+ * VID3 counts as the >8bpp desktop overlay when it is enabled, aliases the GFX
+ * framebuffer base, and carries a genuine RGB FORMAT.  The FORMAT field is what
+ * separates the two modes RISC OS actually produces - confirmed on hardware
+ * registers:
+ *   - 16M-colour: VID3 FORMAT = 0x8 (xRGB8888) -> genuine 32bpp, scan VID3.
+ *   - 256-colour: VID3 left enabled aliasing the 8bpp GFX framebuffer but with
+ *     FORMAT = 0x10 (and a degenerate VID3_SIZE 1x129).  This must NOT be taken
+ *     as 32bpp or the 8bpp desktop renders as a 4x-repeated band; the GFX CLUT8
+ *     path is correct here.
+ * NOTE: VID3 PICTURE_SIZE (0x394) is the full screen resolution in BOTH cases,
+ * so ONLY the FORMAT distinguishes them - 0x10 is deliberately excluded. */
+static bool dispc_vid3_active(TitaniumDISPCState *s)
+{
+    uint32_t v3 = s->regs[R_VID3_ATTRIBUTES];
+    uint32_t f = (v3 >> 1) & 0x1f;
+    bool rgb = (f == 0x6 || f == 0x7 || f == 0x8 || f == 0x9 || f == 0xc ||
+                f == 0xd || f == 0xe || f == 0xf);
+    return (v3 & 1) && s->regs[R_VID3_BA] == s->regs[R_GFX_BA_0] &&
+           s->regs[R_GFX_BA_0] != 0 && rgb;
+}
+
+/* The source picture size to scan out (VID3 PICTURE_SIZE when aliasing). */
+static uint32_t dispc_source_size(TitaniumDISPCState *s)
+{
+    if (dispc_vid3_active(s)) {
+        uint32_t psz = s->regs[R_VID3_PICTURE_SIZE];
+        if ((psz & 0x7ff) && ((psz >> 16) & 0x7ff)) {
+            return psz;
+        }
+    }
+    return s->active_size;
+}
+
+static void dispc_update_geometry(TitaniumDISPCState *s, uint32_t sz)
+{
+    /* sz is the SOURCE picture size to scan out: VID3 PICTURE_SIZE when the
+     * desktop is aliased through VID3, otherwise the last-programmed panel SIZE
+     * (SIZE_DIG 0x78 / SIZE_LCD 0x7C tracked in active_size). Using the source
+     * size - not the panel size - matters when RISC OS runs a smaller desktop
+     * (e.g. 640x480) inside a larger output raster (e.g. 800x600): scanning the
+     * 640-wide framebuffer at 800 wide sheared the image. */
     uint32_t w = (sz & 0x7ff) + 1;
     uint32_t h = ((sz >> 16) & 0x7ff) + 1;
 
-    if (w <= 1 || h <= 1) {     /* GFX_SIZE unset: use the LCD panel size */
+    if (w <= 1 || h <= 1) {     /* nothing programmed yet: fall back to SIZE_LCD */
         uint32_t lcd = s->regs[R_SIZE_LCD];
         w = (lcd & 0x7ff) + 1;
         h = ((lcd >> 16) & 0x7ff) + 1;
     }
 
-    if (w != s->width || h != s->height) {
-        s->width = w;
-        s->height = h;
-        s->fbsection_valid = false;
-        if (w > 1 && h > 1) {
-            qemu_console_resize(s->con, w, h);
-        }
+    /* Defer the actual resize to the main loop (see dispc_resize_bh). */
+    if (w > 1 && h > 1 && (w != s->width || h != s->height) &&
+        (w != s->pend_w || h != s->pend_h)) {
+        s->pend_w = w;
+        s->pend_h = h;
+        qemu_bh_schedule(s->resize_bh);
     }
 }
 
@@ -228,11 +326,36 @@ static void dispc_gfx_update(void *opaque)
 {
     TitaniumDISPCState *s = opaque;
     DisplaySurface *surface;
-    uint32_t fmt = (s->regs[R_GFX_ATTRIBUTES] >> GFX_ATTR_FORMAT_SHIFT) &
-                   GFX_ATTR_FORMAT_MASK;
-    /* fmt: 0x6 = RGB16; 0x8/0x9/0xC/0xD = 32bpp; else (0..3) = CLUT8/8bpp */
-    int bpp = (fmt == 0x6) ? 2 : (fmt >= 0x8) ? 4 : 1;
-    drawfn fn = (bpp == 1) ? draw_line8 : (bpp == 2) ? draw_line16 : draw_line32;
+    /*
+     * The RISC OS desktop framebuffer is always GFX_BA (output 1). At higher
+     * colour depths the VID3 overlay (0x370/0x308) ALIASES that same framebuffer
+     * carrying the real RGB format, while the GFX layer stays format-0 (8bpp
+     * CLUT for 256-colour). VID1 (0xBC) is the SECOND output's test card (the
+     * Elesar "Ti" banner) and must NEVER be read. So: always scan GFX_BA, but
+     * take the pixel format from VID3 when it is enabled, aliases GFX_BA, and
+     * carries an RGB format; otherwise from the GFX layer.
+     */
+    /* The VID overlay FORMAT field is 5 bits [5:1]: RISC OS uses 0x8 (xRGB8888)
+     * for genuine 32bpp.  dispc_vid3_active() also checks VID3 has a real picture
+     * size, so a 256-colour mode (VID3 left enabled at FORMAT 0x10 over a
+     * degenerate region) correctly falls through to the GFX CLUT8 path. */
+    uint32_t fmt;
+    int bpp;
+    drawfn fn;
+
+    if (dispc_vid3_active(s)) {
+        fmt = (s->regs[R_VID3_ATTRIBUTES] >> 1) & 0x1f; /* desktop aliased at >8bpp */
+    } else {
+        fmt = (s->regs[R_GFX_ATTRIBUTES] >> 1) & 0x1f;  /* GFX layer (8bpp CLUT)   */
+    }
+    switch (fmt) {
+    case 0x6:                               bpp = 2; fn = draw_line16; break; /* RGB565   */
+    case 0x7: case 0xf:                     bpp = 2; fn = draw_line15; break; /* xRGB1555 */
+    case 0x9:                               bpp = 3; fn = draw_line24; break; /* RGB24    */
+    case 0x8: case 0xc: case 0xd: case 0xe: case 0x10:
+                                            bpp = 4; fn = draw_line32; break; /* 32bpp    */
+    default:                                bpp = 1; fn = draw_line8;  break; /* 8bpp CLUT*/
+    }
     int src_width, dstride, y;
     int en = dispc_enabled(s);
     uint8_t *src, *dst;
@@ -240,7 +363,7 @@ static void dispc_gfx_update(void *opaque)
     if (!en) {
         return;
     }
-    dispc_update_geometry(s);
+    dispc_update_geometry(s, dispc_source_size(s));
     if (s->width <= 1 || s->height <= 1) {
         return;
     }
@@ -424,14 +547,20 @@ static void dispc_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 
     /* Any change to enable/geometry/base may change the picture */
     switch (addr >> 2) {
+    case R_SIZE_LCD:
+    case R_SIZE_DIG:
+    case R_GFX_SIZE:
+        if ((uint32_t)val) {
+            s->active_size = (uint32_t)val;   /* track the current mode's size */
+        }
+        /* fall through */
     case R_CONTROL1:
     case R_GFX_BA_0:
-    case R_GFX_SIZE:
     case R_GFX_ATTRIBUTES:
         s->fbsection_valid = false;
         s->invalidate = 1;
         if (s->con) {
-            dispc_update_geometry(s);
+            dispc_update_geometry(s, dispc_source_size(s));
         }
         break;
     default:
@@ -461,11 +590,13 @@ static void dispc_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
     s->con = graphic_console_init(dev, 0, &dispc_gfx_ops, s);
-    /* Size the console once, here, so the display backend binds to a stable
-     * surface. Resizing from inside gfx_update (which runs during the backend's
-     * own refresh) is re-entrant and leaves SDL rendering a stale surface. */
-    s->width = 640;
-    s->height = 480;
+    /* Mode-change resizes are deferred to this bottom-half so qemu_console_resize
+     * runs on the main loop (safe for SDL); see dispc_resize_bh. The initial size
+     * is set directly here, during init on the main thread. */
+    s->resize_bh = qemu_bh_new_guarded(dispc_resize_bh, s,
+                                       &dev->mem_reentrancy_guard);
+    s->width = s->pend_w = 640;
+    s->height = s->pend_h = 480;
     qemu_console_resize(s->con, s->width, s->height);
     s->vsync = timer_new_ns(QEMU_CLOCK_VIRTUAL, dispc_vsync_tick, s);
     timer_mod(s->vsync, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
@@ -483,6 +614,7 @@ static void dispc_reset_hold(Object *obj, ResetType type)
         s->palette[i] = (i << 16) | (i << 8) | i;
     }
     s->width = s->height = 0;
+    s->pend_w = s->pend_h = 0;
     s->fbsection_valid = false;
     s->invalidate = 1;
 }

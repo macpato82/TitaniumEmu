@@ -24,9 +24,15 @@ core, GIC, generic timer and device framework, so a Titanium board is a
 ## Contents
 
 - `hw/arm/titanium.c` — the machine model (also provided as a patch).
-- `hw/display/titanium_dispc.c` — minimal DSS/DISPC framebuffer scan-out device.
+- `hw/display/titanium_dispc.c` — minimal DSS/DISPC framebuffer scan-out device
+  (8bpp CLUT, 16/24/32bpp via the VID3 overlay, hardware-cursor compositing).
+- `hw/net/titanium_cpsw.c` — **experimental, work-in-progress** CPSW Ethernet
+  NIC. The machine boots with it attached, but the RISC OS EtherCPSW driver
+  aborts when networking is actually configured/used; not yet functional.
 - `0001-hw-arm-add-titanium-am5728-machine.patch` — apply to **QEMU v10.2.1**
-  (adds the machine + DISPC, wires `meson.build`/`Kconfig`).
+  (adds the machine, DISPC, the experimental CPSW NIC, and the AHCI
+  port-multiplier soft-reset fix for the SATA boot disc; wires
+  `meson.build`/`Kconfig`).
 - `docs/boot-notes.md` — detailed analysis of the AM5728 boot as the ROM
   performs it, and the debug-ROM diagnosis of each blocker.
 
