@@ -1,4 +1,4 @@
-# RISC OS Titulator — Based on the A15 Titanium
+# RISC OS Titulator — Based on the A15 ARM Processor
 
 
 Each blocker was cracked with a **`Debug=TRUE` ROM** (built from the RISC OS Open
