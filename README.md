@@ -1,4 +1,4 @@
-# A15 Titanium Emulator
+# A15 OMAP Emulator Based on Ti AM5728 and Ti HAL RISCOS 5
 
 An emulator for the RISC OS **A15 Titanium** machine, based on the Texas Instruments **AM5728** SoC (dual Cortex-A15).
 
