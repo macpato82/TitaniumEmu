@@ -2,7 +2,7 @@
  * TI AM5728 CPSW (GMAC_SW) 3-port gigabit Ethernet switch - minimal model.
  *
  * Models enough of the classic cpsw_3g IP (the same block as AM335x/DRA7) for
- * the RISC OS "EtherNIC_CPSW" driver on the Elesar Titanium to bring the link
+ * the RISC OS "EtherNIC_CPSW" driver on the OMAP5 Ti Emulator to bring the link
  * up and move packets:  the SS/PORT/CPDMA/STATERAM/ALE/SL/MDIO/WR register
  * blocks, one host CPDMA channel pair (TX0/RX0) using CPPI descriptors in the
  * 8 KiB descriptor SRAM, an always-link-up MDIO PHY, and the wrapper RX/TX

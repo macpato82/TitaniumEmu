@@ -1,5 +1,5 @@
 /*
- * Elesar Titanium machine model (TI AM5728, dual Cortex-A15) - EXPERIMENTAL
+ * OMAP5 Ti Emulator machine model (TI AM5728, dual Cortex-A15) - EXPERIMENTAL
  *
  * Phase 1 skeleton for booting RISC OS 5 (Titanium port). Provides just
  * enough of the AM5728 to bring the RISC OS HAL to its first debug output:
@@ -1312,7 +1312,7 @@ static void titanium_init(MachineState *machine)
 
 static void titanium_machine_init(MachineClass *mc)
 {
-    mc->desc = "Elesar Titanium (TI AM5728, Cortex-A15) [experimental]";
+    mc->desc = "OMAP5 Ti Emulator (TI AM5728, Cortex-A15) [experimental]";
     mc->init = titanium_init;
     /* RISC OS runs on a single A15 core only; the other cores stay idle. */
     mc->max_cpus = 1;

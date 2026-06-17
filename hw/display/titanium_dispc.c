@@ -1,6 +1,6 @@
 /*
  * TI AM5728 DSS / DISPC display controller — minimal framebuffer scan-out
- * for the Elesar Titanium machine (RISC OS 5).
+ * for the OMAP5 Ti Emulator machine (RISC OS 5).
  *
  * Models just enough of DISPC to (a) satisfy the HAL/kernel's register polls
  * and (b) scan out the GFX pipeline framebuffer that RISC OS sets up in DRAM,
@@ -331,7 +331,7 @@ static void dispc_gfx_update(void *opaque)
      * colour depths the VID3 overlay (0x370/0x308) ALIASES that same framebuffer
      * carrying the real RGB format, while the GFX layer stays format-0 (8bpp
      * CLUT for 256-colour). VID1 (0xBC) is the SECOND output's test card (the
-     * Elesar "Ti" banner) and must NEVER be read. So: always scan GFX_BA, but
+     * OMAP5 Ti Emulator "Ti" banner) and must NEVER be read. So: always scan GFX_BA, but
      * take the pixel format from VID3 when it is enabled, aliases GFX_BA, and
      * carries an RGB format; otherwise from the GFX layer.
      */

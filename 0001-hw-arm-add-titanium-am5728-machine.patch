@@ -41,7 +41,7 @@ index 0000000..dcfc233
 +++ b/hw/arm/titanium.c
 @@ -0,0 +1,1329 @@
 +/*
-+ * Elesar Titanium machine model (TI AM5728, dual Cortex-A15) - EXPERIMENTAL
++ * OMAP5 Ti Emulator machine model (TI AM5728, dual Cortex-A15) - EXPERIMENTAL
 + *
 + * Phase 1 skeleton for booting RISC OS 5 (Titanium port). Provides just
 + * enough of the AM5728 to bring the RISC OS HAL to its first debug output:
@@ -1354,7 +1354,7 @@ index 0000000..dcfc233
 +
 +static void titanium_machine_init(MachineClass *mc)
 +{
-+    mc->desc = "Elesar Titanium (TI AM5728, Cortex-A15) [experimental]";
++    mc->desc = "OMAP5 Ti Emulator (TI AM5728, Cortex-A15) [experimental]";
 +    mc->init = titanium_init;
 +    /* RISC OS runs on a single A15 core only; the other cores stay idle. */
 +    mc->max_cpus = 1;
@@ -1404,7 +1404,7 @@ index 0000000..f3e93d4
 @@ -0,0 +1,643 @@
 +/*
 + * TI AM5728 DSS / DISPC display controller — minimal framebuffer scan-out
-+ * for the Elesar Titanium machine (RISC OS 5).
++ * for the OMAP5 Ti Emulator machine (RISC OS 5).
 + *
 + * Models just enough of DISPC to (a) satisfy the HAL/kernel's register polls
 + * and (b) scan out the GFX pipeline framebuffer that RISC OS sets up in DRAM,
@@ -1735,7 +1735,7 @@ index 0000000..f3e93d4
 +     * colour depths the VID3 overlay (0x370/0x308) ALIASES that same framebuffer
 +     * carrying the real RGB format, while the GFX layer stays format-0 (8bpp
 +     * CLUT for 256-colour). VID1 (0xBC) is the SECOND output's test card (the
-+     * Elesar "Ti" banner) and must NEVER be read. So: always scan GFX_BA, but
++     * OMAP5 Ti Emulator "Ti" banner) and must NEVER be read. So: always scan GFX_BA, but
 +     * take the pixel format from VID3 when it is enabled, aliases GFX_BA, and
 +     * carries an RGB format; otherwise from the GFX layer.
 +     */
@@ -2099,7 +2099,7 @@ index 0000000..bcd9834
 + * TI AM5728 CPSW (GMAC_SW) 3-port gigabit Ethernet switch - minimal model.
 + *
 + * Models enough of the classic cpsw_3g IP (the same block as AM335x/DRA7) for
-+ * the RISC OS "EtherNIC_CPSW" driver on the Elesar Titanium to bring the link
++ * the RISC OS "EtherNIC_CPSW" driver on the OMAP5 Ti Emulator to bring the link
 + * up and move packets:  the SS/PORT/CPDMA/STATERAM/ALE/SL/MDIO/WR register
 + * blocks, one host CPDMA channel pair (TX0/RX0) using CPPI descriptors in the
 + * 8 KiB descriptor SRAM, an always-link-up MDIO PHY, and the wrapper RX/TX
